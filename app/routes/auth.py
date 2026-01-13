@@ -406,41 +406,90 @@ def signup(data: AuthRequest):
 #         "refresh_token": res.session.refresh_token
 #     }
 
+# @router.post("/signin")
+# def signin(data: AuthRequest):
+#     try:
+#         res = supabase.auth.sign_in_with_password({
+#             "email": data.email,
+#             "password": data.password
+#         })
+#     except Exception as e:
+#         # Invalid email / password
+#         raise HTTPException(
+#             status_code=401,
+#             detail="Invalid email or password"
+#         )
+
+#     if not res or not res.user:
+#         raise HTTPException(
+#             status_code=401,
+#             detail="Invalid email or password"
+#         )
+
+#     device = (
+#         supabase
+#         .table("user_devices")
+#         .select("id")
+#         .eq("user_id", res.user.id)
+#         .eq("browser_id", data.browser_id)
+#         .execute()
+#     )
+
+#     if not device.data:
+#         raise HTTPException(
+#             status_code=403,
+#             detail="Browser not registered"
+#         )
+
+#     return {
+#         "success": True,
+#         "access_token": res.session.access_token,
+#         "refresh_token": res.session.refresh_token
+#     }
+
+
+from fastapi import HTTPException
+
 @router.post("/signin")
 def signin(data: AuthRequest):
+    # 1️⃣ Authenticate user (email + password only)
     try:
         res = supabase.auth.sign_in_with_password({
             "email": data.email,
             "password": data.password
         })
-    except Exception as e:
-        # Invalid email / password
+    except Exception:
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password"
         )
 
-    if not res or not res.user:
+    if not res or not res.user or not res.session:
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password"
         )
 
+    user_id = res.user.id
+
+    # 2️⃣ Check if browser already registered
     device = (
         supabase
         .table("user_devices")
         .select("id")
-        .eq("user_id", res.user.id)
+        .eq("user_id", user_id)
         .eq("browser_id", data.browser_id)
         .execute()
     )
 
+    # 3️⃣ If browser not registered → register it
     if not device.data:
-        raise HTTPException(
-            status_code=403,
-            detail="Browser not registered"
-        )
+        supabase.table("user_devices").insert({
+            "user_id": user_id,
+            "browser_id": data.browser_id
+        }).execute()
 
+    # 4️⃣ Successful login response
     return {
         "success": True,
         "access_token": res.session.access_token,
