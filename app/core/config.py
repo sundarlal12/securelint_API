@@ -9,10 +9,27 @@
 # if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 #     raise RuntimeError("Supabase env vars not loaded")
 
+# import os
+
+# SUPABASE_URL = os.getenv("SUPABASE_URL")
+# SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+# if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+#     raise RuntimeError("SUPABASE_URL or SUPABASE_ANON_KEY is not set")
+
+
 import os
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+# Load .env ONLY for local development
+if os.getenv("VERCEL") != "1":
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("SUPABASE_URL or SUPABASE_ANON_KEY is not set")
+    raise RuntimeError("Supabase env vars not loaded")
