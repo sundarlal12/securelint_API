@@ -27,6 +27,7 @@ from app.routes.me import router as me_router
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes.subscription import router as subscription_router
 from app.routes.settings import router as settings_router
+from app.routes.incidents import router as incidents_router
 
 app = FastAPI(
     title="SecureLint API",
@@ -57,3 +58,4 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(me_router, prefix="/api")
 app.include_router(subscription_router, prefix="/api")
 app.include_router(settings_router, prefix="/api")
+app.include_router(incidents_router, prefix="/api")
