@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from app.core.config import SUPABASE_URL\")",
+      "Bash(pip install *)",
+      "Bash(xargs kill -9)",
+      "Bash(curl -s -X POST http://localhost:8000/api/signin -H 'Content-Type: application/json' -d '{\"email\":\"sundar.baror@anakin.company\",\"password\":\"12345678\",\"browser_id\":\"test-browser-1\"}')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -X POST http://localhost:8000/api/scan -H 'Content-Type: application/json' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsImtpZCI6Iktrd3NlUFNEVE9COHRWcmUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2pocWd5dWZzZ3hqZXNzZnZkeXljLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJlOGMwYTk3Mi0yN2ZlLTRjOTYtODI2ZS1lMmRkZjExNWYyZGMiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzc5MzEyMjg0LCJpYXQiOjE3Nzg3MDc0ODQsImVtYWlsIjoic3VuZGFyLmJhcm9yQGFuYWtpbi5jb21wYW55IiwicGhvbmUiOiIiLCJhcHBfbWV0YWRhdGEiOnsicHJvdmlkZXIiOiJlbWFpbCIsInByb3ZpZGVycyI6WyJlbWFpbCJdfSwidXNlcl9tZXRhZGF0YSI6eyJlbWFpbCI6InN1bmRhci5iYXJvckBhbmFraW4uY29tcGFueSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJwaG9uZV92ZXJpZmllZCI6ZmFsc2UsInN1YiI6ImU4YzBhOTcyLTI3ZmUtNGM5Ni04MjZlLWUyZGRmMTE1ZjJkYyJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzc4NzA3NDg0fV0sInNlc3Npb25faWQiOiI0MmNiZDliMi1kNmJiLTRlZWYtYTVmNi0xMTJhMGM5OGYxYzkiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.Y_UA7sZMQVgtj70B2wd1c4wdVhf8e0DA-QIMKsuBEtg' -d '{\"url\":\"https://playstore-br.com\",\"model\":\"claude-sonnet-4-6\"}')",
+      "Bash(jobs -l)",
+      "Bash(lsof -ti :8000 | xargs kill -9 2>/dev/null; sleep 1 *)",
+      "Bash(curl -s https://jhqgyufsgxjessfvdyyc.supabase.co/rest/v1/ -H 'apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs')",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('\\\\n'.join\\(k for k in d.get\\('paths',{}\\).keys\\(\\) if k != '/'\\)\\)\")",
+      "Bash(curl -s https://jhqgyufsgxjessfvdyyc.supabase.co/rest/v1/user_profiles?limit=1 -H 'apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs')",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -s https://jhqgyufsgxjessfvdyyc.supabase.co/rest/v1/user_subscriptions?user_id=eq.e8c0a972-27fe-4c96-826e-e2ddf115f2dc -H 'apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs')",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('score:', d['score'], '| status:', d['status'], '| domain used:', d['site_metadata']['domain']\\)\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('score:', d['score'], '| status:', d['status']\\)\")",
+      "Bash(curl -s 'https://jhqgyufsgxjessfvdyyc.supabase.co/rest/v1/whois_phish?url=eq.https%3A%2F%2Fplaystore-br.com&select=domain,url,score,status,verdict' -H 'apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs')",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('score:', d['score'], '| status:', d['status'], '| verdict:', d['verdict'][:100]\\)\")",
+      "Bash(curl -s 'https://jhqgyufsgxjessfvdyyc.supabase.co/rest/v1/whois_phish?domain=in.\\(securelint.in,vaptlabs.com\\)&select=domain,url,score,status,verdict' -H 'apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs')",
+      "Bash(curl -s 'https://jhqgyufsgxjessfvdyyc.supabase.co/rest/v1/whois_phish?domain=in.\\(securelint.in,vaptlabs.com\\)&select=domain,url,score,status,verdict&order=domain' -H 'apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpocWd5dWZzZ3hqZXNzZnZkeXljIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Njg4ODM2NiwiZXhwIjoyMDcyNDY0MzY2fQ.fJ1QqJncvnDSNKOqxhM1u8UvBwTO7Eb1PLDqQcnWvKs')",
+      "Bash(curl -s http://localhost:8000/api/scan/models)",
+      "Bash(curl -s http://localhost:8000/api/me)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

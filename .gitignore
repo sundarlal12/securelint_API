@@ -1,0 +1,5 @@
+.env
+app/routes/.env
+__pycache__/
+*.pyc
+.DS_Store

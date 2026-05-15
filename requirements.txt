@@ -1,5 +1,10 @@
 fastapi
+uvicorn
 python-jose
 requests
+httpx
+anthropic
+groq
+pyyaml
 supabase
 python-dotenv
