@@ -8,3 +8,4 @@ groq
 pyyaml
 supabase
 python-dotenv
+razorpay
