@@ -9,3 +9,4 @@ pyyaml
 supabase
 python-dotenv
 razorpay
+email-validator
