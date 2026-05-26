@@ -35,9 +35,9 @@ _USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-WOT_BASE = os.getenv("WOT_SCAN_URL")
-if not WOT_BASE:
-    raise RuntimeError("WOT_SCAN_URL is not set in environment variables")
+securelint_BASE = os.getenv("SCAN_URL")
+if not securelint_BASE:
+    raise RuntimeError("SCAN_URL is not set in environment variables")
 
 # Fixed gbData payload (matches the extension's format)
 GB_DATA = (
@@ -49,7 +49,7 @@ GB_DATA = (
 @router.get("/scanEmails")
 async def scan_emails(email: str = Query(..., description="Email address to scan for leaks")):
     """
-    Proxy wrapper around the WOT leak-scan API.
+    Proxy wrapper around the securelint leak-scan API.
     Adds a random User-Agent on every request to avoid rate-limiting.
     """
     params = {
@@ -70,16 +70,16 @@ async def scan_emails(email: str = Query(..., description="Email address to scan
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(WOT_BASE, params=params, headers=headers)
+            resp = await client.get(securelint_BASE, params=params, headers=headers)
             resp.raise_for_status()
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=exc.response.status_code,
-            detail=f"Upstream WOT API error: {exc.response.text}",
+            detail=f"Upstream securelint API error: {exc.response.text}",
         )
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to reach WOT API: {str(exc)}",
+            detail=f"Failed to reach securelint API: {str(exc)}",
         )
