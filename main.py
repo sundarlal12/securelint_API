@@ -47,14 +47,16 @@ origins = [
     "http://localhost:5500",
     "http://127.0.0.1:3000",
     "http://localhost:3000",
-  "http://127.0.0.1:8000",   
-    "https://securelint.app",       # production site
+    "http://127.0.0.1:8000",
+    "https://securelint.app",       # production site (.app)
+    "https://securelint.in",        # production site (.in)
+    "https://www.securelint.in"
+   
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=origins,
-    allow_origins=["*"],
+    allow_origins=origins,          # explicit list required when allow_credentials=True
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
