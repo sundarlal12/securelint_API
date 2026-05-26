@@ -35,9 +35,9 @@ _USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-securelint_BASE = os.getenv("SCAN_URL")
+securelint_BASE = os.getenv("WOT_SCAN_URL")
 if not securelint_BASE:
-    raise RuntimeError("SCAN_URL is not set in environment variables")
+    raise RuntimeError("WOT_SCAN_URL is not set in environment variables")
 
 # Fixed gbData payload (matches the extension's format)
 GB_DATA = (
