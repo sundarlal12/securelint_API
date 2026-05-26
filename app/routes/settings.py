@@ -24,12 +24,35 @@ def get_settings(user=Depends(verify_supabase_jwt)):
     )
 
     if not res.data:
-        # auto-create default settings
+        # auto-create default settings (all features off for new users)
         default = {
-            "user_id": user_id,
-            "enable_detection": False,
-            "auto_mask_critical": False,
-            "show_notifications": False
+            "user_id":                   user_id,
+            "Plans":                     "free",
+            "enable_detection":          False,
+            "auto_mask_critical":        False,
+            "show_notifications":        False,
+            "mask_console":              False,
+            "scan_large_docs":           False,
+            "realtime_updates":          False,
+            "show_risk_score":           False,
+            "show_recent_activity":      False,
+            "animated_charts":           False,
+            "auto_refresh":              False,
+            "preserve_context":          False,
+            "auto_mask_textareas":       False,
+            "auto_mask_inputs":          False,
+            "overlay_input":             False,
+            "overlay_textarea":          False,
+            "overlay_editor":            False,
+            "block_network_secrets":     False,
+            "block_form_submission":     False,
+            "aggressive_email_blocking": False,
+            "detect_critical":           False,
+            "detect_high":               False,
+            "detect_medium":             False,
+            "detect_low":                False,
+            "notify_critical":           False,
+            "notify_high":               False,
         }
         supabase.table("user_settings").insert(default).execute()
         return default
@@ -76,6 +99,7 @@ def update_settings(
 
     # ✅ EXACT columns from your table
     allowed_fields = {
+        "Plans",
         "show_risk_score",
         "show_recent_activity",
         "animated_charts",
