@@ -2,4 +2,5 @@
 app/routes/.env
 __pycache__/
 *.pyc
+*.sql
 .DS_Store

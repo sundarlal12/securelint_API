@@ -11,3 +11,4 @@ python-dotenv
 razorpay
 email-validator
 resend
+google-auth

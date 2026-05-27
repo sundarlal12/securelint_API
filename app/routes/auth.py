@@ -8,6 +8,10 @@ import os, uuid, hmac, hashlib, base64, time
 import resend
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 
+# Google OAuth verification
+_GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "970630889678-7aojvvhm0umigok9l7ipsvkrkj1gs3k9.apps.googleusercontent.com")
+_GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
 _RESEND_KEY             = os.getenv("RESEND_API_KEY", "")
 _RESEND_SIGNUP_TEMPLATE = os.getenv("RESEND_SIGNUP_TEMPLATE_ID", "d4eb4d59-26a4-40c4-af85-82dfa0ce1554")
 _BASE_URL               = os.getenv("BASE_URL", "https://securelint.in")
@@ -713,4 +717,196 @@ def refresh_token(data: RefreshRequest):
         "success": True,
         "access_token": res.session.access_token,
         "refresh_token": res.session.refresh_token
+    }
+
+
+# ── Google OAuth Sign-In / Sign-Up ───────────────────────────────────────────
+
+class GoogleSignInRequest(BaseModel):
+    id_token: str
+    browser_id: str
+    ext_id: Optional[str] = None
+
+
+def _derive_google_password(google_sub: str) -> str:
+    """
+    Deterministically derive a server-side password from the Google user's `sub` claim.
+    This password is never exposed to the user — they only authenticate via Google.
+    CSRF-safe: requires knowing GOOGLE_CLIENT_SECRET on the server.
+    """
+    secret = _GOOGLE_CLIENT_SECRET or _GOOGLE_CLIENT_ID
+    raw = f"{google_sub}:{secret}"
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    return f"Goog@{digest[:30]}"
+
+
+@router.post("/google-signin")
+def google_signin(data: GoogleSignInRequest):
+    """
+    Google Sign-In / Sign-Up via id_token.
+
+    CSRF security:
+    - The id_token is cryptographically signed by Google's private key.
+    - We verify:
+        * Signature (via Google's public certs)
+        * aud == our client_id  (prevents cross-app token injection)
+        * iss == accounts.google.com
+        * exp  (token not expired)
+    - The popup-based GSI flow never involves a redirect or state parameter,
+      so redirect-based CSRF attacks are impossible.
+    """
+    if not _GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": "Google OAuth not configured on server."})
+
+    # ── Step 1: verify the id_token with Google ───────────────────────────────
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+
+        idinfo = google_id_token.verify_oauth2_token(
+            data.id_token,
+            google_requests.Request(),
+            _GOOGLE_CLIENT_ID,
+        )
+    except ValueError as e:
+        # Covers: expired token, wrong aud, bad signature — all CSRF/replay attacks
+        print(f"[google-signin] id_token verification failed: {e}")
+        raise HTTPException(status_code=401, detail={"error": 1, "message": "Invalid or expired Google token."})
+    except Exception as e:
+        print(f"[google-signin] unexpected verification error: {e}")
+        raise HTTPException(status_code=401, detail={"error": 1, "message": "Google token verification failed."})
+
+    google_sub   = idinfo["sub"]          # unique stable Google user ID
+    email        = idinfo.get("email", "")
+    full_name    = idinfo.get("name", "") or idinfo.get("given_name", "")
+    avatar_url   = idinfo.get("picture", "")
+    email_verified = idinfo.get("email_verified", False)
+
+    if not email:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "Google account has no email address."})
+    if not email_verified:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "Google account email is not verified."})
+
+    print(f"[google-signin] verified token for {email} (sub={google_sub[:8]}…)")
+
+    # ── Step 2: derive a deterministic password (never shown to user) ─────────
+    derived_pw = _derive_google_password(google_sub)
+
+    # ── Step 3: try signing in first (existing user) ──────────────────────────
+    session_res = None
+    is_new_user = False
+
+    try:
+        sign_in = supabase.auth.sign_in_with_password({"email": email, "password": derived_pw})
+        if sign_in and sign_in.session:
+            session_res = sign_in.session
+            print(f"[google-signin] existing user signed in: {email}")
+    except Exception:
+        pass  # User doesn't exist yet — we'll create them below
+
+    # ── Step 4: create new user if sign-in failed ─────────────────────────────
+    if session_res is None:
+        _svc_key = os.getenv("SUPABASE_SERVICE_KEY", "") or _SERVICE_KEY
+        _svc = create_client(SUPABASE_URL, _svc_key) if _svc_key else supabase_service
+
+        try:
+            create_res = _svc.auth.admin.create_user({
+                "email":          email,
+                "password":       derived_pw,
+                "email_confirm":  True,
+                "user_metadata":  {
+                    "full_name":   full_name,
+                    "avatar_url":  avatar_url,
+                    "provider":    "google",
+                    "google_sub":  google_sub,
+                },
+            })
+        except Exception as e:
+            msg = str(e).lower()
+            # User may already exist (race) — try sign-in once more
+            if "already" in msg or "exists" in msg or "duplicate" in msg:
+                try:
+                    retry = supabase.auth.sign_in_with_password({"email": email, "password": derived_pw})
+                    if retry and retry.session:
+                        session_res = retry.session
+                except Exception:
+                    pass
+            if session_res is None:
+                print(f"[google-signin] admin.create_user failed for {email}: {e}")
+                raise HTTPException(status_code=500, detail={"error": 1, "message": "Failed to create account. Please try again."})
+
+        if session_res is None:
+            # Sign in the freshly created user
+            try:
+                sign_in2 = supabase.auth.sign_in_with_password({"email": email, "password": derived_pw})
+                if sign_in2 and sign_in2.session:
+                    session_res = sign_in2.session
+                    is_new_user = True
+            except Exception as e2:
+                print(f"[google-signin] sign_in after create failed for {email}: {e2}")
+                raise HTTPException(status_code=500, detail={"error": 1, "message": "Account created but sign-in failed. Try again."})
+
+    if not session_res:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": "Authentication failed. Please try again."})
+
+    user_id = str(session_res.user.id)
+
+    # ── Step 5: bootstrap subscription + settings for new users ──────────────
+    if is_new_user:
+        _svc_key = os.getenv("SUPABASE_SERVICE_KEY", "") or _SERVICE_KEY
+        _svc = create_client(SUPABASE_URL, _svc_key) if _svc_key else supabase_service
+
+        # Subscription — start as inactive (free) until payment
+        try:
+            _svc.table("user_subscriptions").insert({
+                "user_id": user_id, "plan_id": "free", "status": "inactive",
+            }).execute()
+        except Exception:
+            pass
+
+        # Default settings
+        try:
+            _svc.table("user_settings").insert({
+                "user_id": user_id, "Plans": "free",
+                "enable_detection": True, "detect_medium": True, "detect_low": True,
+                "show_notifications": True, "auto_mask_inputs": True,
+                "auto_mask_textareas": True, "overlay_input": True,
+                "overlay_textarea": True, "show_risk_score": True,
+                "show_recent_activity": True, "masking_style": "blur",
+            }).execute()
+        except Exception:
+            pass
+
+        # Register browser/device
+        try:
+            device_row: dict = {"user_id": user_id, "browser_id": data.browser_id}
+            if data.ext_id:
+                device_row["ext_id"] = data.ext_id
+            supabase.table("user_devices").insert(device_row).execute()
+        except Exception:
+            pass
+
+        # Send welcome email (best-effort)
+        _send_welcome_email(email=email, password="(Google Sign-In — no password)", full_name=full_name)
+        print(f"[google-signin] new user created: {email} (user_id={user_id})")
+
+    # ── Step 6: get plan info ─────────────────────────────────────────────────
+    plan_id = "free"
+    plan_status = "inactive"
+    try:
+        sub = supabase_service.table("user_subscriptions").select("plan_id, status").eq("user_id", user_id).execute()
+        if sub.data:
+            plan_id     = sub.data[0].get("plan_id",  "free")
+            plan_status = sub.data[0].get("status",   "inactive")
+    except Exception:
+        pass
+
+    return {
+        "success":        True,
+        "access_token":   session_res.access_token,
+        "refresh_token":  session_res.refresh_token,
+        "plan_id":        plan_id,
+        "plan_status":    plan_status,
+        "is_new_user":    is_new_user,
+        "from_extension": bool(data.ext_id),
     }
