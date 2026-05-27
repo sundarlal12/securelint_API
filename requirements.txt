@@ -10,3 +10,4 @@ supabase
 python-dotenv
 razorpay
 email-validator
+resend

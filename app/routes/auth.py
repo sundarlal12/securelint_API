@@ -4,46 +4,38 @@ from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from supabase import create_client
 from typing import Optional
-import os, uuid, hmac, hashlib, base64, time, httpx
+import os, uuid, hmac, hashlib, base64, time
+import resend
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 
 _RESEND_KEY             = os.getenv("RESEND_API_KEY", "")
-_RESEND_SIGNUP_TEMPLATE = os.getenv("RESEND_SIGNUP_TEMPLATE_ID", "")
+_RESEND_SIGNUP_TEMPLATE = os.getenv("RESEND_SIGNUP_TEMPLATE_ID", "d4eb4d59-26a4-40c4-af85-82dfa0ce1554")
 _BASE_URL               = os.getenv("BASE_URL", "https://securelint.in")
 
 
 def _send_welcome_email(email: str, password: str, full_name: str = "") -> None:
     """
-    Send a welcome / account-created email via Resend using a pre-built template.
-    Template variables used: {{email}}, {{temp_password}}
+    Send welcome email via Resend template.
+    Template variables: {{email}}, {{temp_password}}
     Best-effort — never raises, never blocks signup.
     """
-    if not _RESEND_KEY or not _RESEND_SIGNUP_TEMPLATE:
+    if not _RESEND_KEY:
         return
     try:
-        httpx.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {_RESEND_KEY}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "from": "SecureLint <noreply@securelint.in>",
-                "to":   [email],
-                "template": {
-                    "id": _RESEND_SIGNUP_TEMPLATE,
-                    "variables": {
-                        "email":         email,
-                        "temp_password": password,
-                        "full_name":     full_name or email.split("@")[0],
-                        "dashboard_url": f"{_BASE_URL}/user/dashboard",
-                    },
+        resend.api_key = _RESEND_KEY
+        resend.Emails.send({
+            "from": "SecureLint <noreply@securelint.in>",
+            "to":   email,
+            "template": {
+                "id": _RESEND_SIGNUP_TEMPLATE,
+                "variables": {
+                    "email":         email,
+                    "temp_password": password,
                 },
             },
-            timeout=10,
-        )
-    except Exception:
-        pass  # Never block signup for an email failure
+        })
+    except Exception as e:
+        print(f"[welcome-email] failed for {email}: {e}")
 
 router = APIRouter()
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -693,6 +685,35 @@ def admin_login(data: AuthRequest):
 
 
 
+
+
+# ── POST /api/test-welcome-email ─────────────────────────────────────────────
+# DELETE this endpoint before going fully public — only for testing email delivery
+class TestEmailRequest(BaseModel):
+    email: str
+    temp_password: Optional[str] = "Test@1234"
+
+@router.post("/test-welcome-email")
+def test_welcome_email(body: TestEmailRequest):
+    """Test the signup welcome email. Remove this endpoint after confirming it works."""
+    if not _RESEND_KEY:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": "RESEND_API_KEY not set."})
+    try:
+        resend.api_key = _RESEND_KEY
+        result = resend.Emails.send({
+            "from": "SecureLint <noreply@securelint.in>",
+            "to":   body.email,
+            "template": {
+                "id": _RESEND_SIGNUP_TEMPLATE,
+                "variables": {
+                    "email":         body.email,
+                    "temp_password": body.temp_password,
+                },
+            },
+        })
+        return {"error": 0, "message": "Email sent.", "resend_response": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": str(e)})
 
 
 @router.post("/refresh")
