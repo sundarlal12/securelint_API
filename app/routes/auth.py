@@ -4,8 +4,46 @@ from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from supabase import create_client
 from typing import Optional
-import os, uuid, hmac, hashlib, base64, time
+import os, uuid, hmac, hashlib, base64, time, httpx
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
+
+_RESEND_KEY             = os.getenv("RESEND_API_KEY", "")
+_RESEND_SIGNUP_TEMPLATE = os.getenv("RESEND_SIGNUP_TEMPLATE_ID", "")
+_BASE_URL               = os.getenv("BASE_URL", "https://securelint.in")
+
+
+def _send_welcome_email(email: str, password: str, full_name: str = "") -> None:
+    """
+    Send a welcome / account-created email via Resend using a pre-built template.
+    Template variables used: {{email}}, {{temp_password}}
+    Best-effort — never raises, never blocks signup.
+    """
+    if not _RESEND_KEY or not _RESEND_SIGNUP_TEMPLATE:
+        return
+    try:
+        httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {_RESEND_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "from": "SecureLint <noreply@securelint.in>",
+                "to":   [email],
+                "template": {
+                    "id": _RESEND_SIGNUP_TEMPLATE,
+                    "variables": {
+                        "email":         email,
+                        "temp_password": password,
+                        "full_name":     full_name or email.split("@")[0],
+                        "dashboard_url": f"{_BASE_URL}/user/dashboard",
+                    },
+                },
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass  # Never block signup for an email failure
 
 router = APIRouter()
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -469,6 +507,13 @@ def signup(data: SignupRequest):
             pass
 
     from_extension = bool(data.ext_id)
+
+    # ── Send welcome email with login credentials ─────────────────────────────
+    _send_welcome_email(
+        email     = data.email,
+        password  = data.password,
+        full_name = data.full_name or "",
+    )
 
     if res.session is None:
         return {
