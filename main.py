@@ -41,17 +41,20 @@ app = FastAPI(
 )
 
 origins = [
-    "http://127.0.0.1:5500",        # local html (live server)
+    # local dev
+    "http://127.0.0.1:5500",
     "http://localhost:5500",
     "http://127.0.0.1:3000",
     "http://localhost:3000",
     "http://127.0.0.1:8000",
-    "https://securelint.netlify.app",
     "http://localhost:8000",
-    "https://securelint.app",       # production site (.app)
-    "https://securelint.in",        # production site (.in)
-    "https://www.securelint.in"
-   
+    # production
+    "https://securelint.app",
+    "https://securelint.in",
+    "https://www.securelint.in",
+    # Netlify deployments (main + preview branches)
+    "https://securelint-nextjs.netlify.app",
+    "https://securelint.netlify.app",
 ]
 
 app.add_middleware(

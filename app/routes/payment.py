@@ -157,6 +157,22 @@ def get_rzp_key():
     return {"error": 0, "key_id": _RZP_KEY_ID}
 
 
+# ── GET /api/payment/debug ────────────────────────────────────────────────────
+# Shows config status — remove or protect this before going to production
+@router.get("/payment/debug")
+def payment_debug():
+    """Quick health-check: shows whether Razorpay keys are loaded (never exposes the actual secrets)."""
+    return {
+        "razorpay_key_id_set":     bool(_RZP_KEY_ID),
+        "razorpay_key_id_prefix":  _RZP_KEY_ID[:12] + "…" if _RZP_KEY_ID else None,
+        "razorpay_key_is_live":    _RZP_KEY_ID.startswith("rzp_live_") if _RZP_KEY_ID else False,
+        "razorpay_secret_set":     bool(_RZP_SECRET),
+        "razorpay_secret_is_placeholder": _RZP_SECRET == "PASTE_YOUR_LIVE_SECRET_HERE",
+        "supabase_service_key_set": bool(_SERVICE_KEY),
+        "resend_key_set":          bool(_RESEND_KEY),
+    }
+
+
 # ── POST /api/payment/create-order ───────────────────────────────────────────
 class CreateOrderRequest(BaseModel):
     plan_id:        str
@@ -259,11 +275,12 @@ def create_order(
 
 # ── POST /api/payment/verify ──────────────────────────────────────────────────
 class VerifyPaymentRequest(BaseModel):
-    razorpay_order_id:   str
     razorpay_payment_id: str
-    razorpay_signature:  str
     plan_id:             str
     billing_period:      Optional[str] = "monthly"
+    # These come from Razorpay popup callback — required for paid plans only
+    razorpay_order_id:   Optional[str] = None
+    razorpay_signature:  Optional[str] = None
 
 
 @router.post("/payment/verify")
@@ -273,25 +290,38 @@ def verify_payment(
 ):
     user_id = _require_user(authorization)
 
-    # 1. Verify HMAC signature
-    expected = hmac.new(
-        _RZP_SECRET.encode(),
-        f"{body.razorpay_order_id}|{body.razorpay_payment_id}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
+    # 1. Verify HMAC signature (only for paid plans that went through Razorpay)
+    if body.razorpay_order_id and body.razorpay_signature:
+        if not _RZP_SECRET:
+            raise HTTPException(status_code=500, detail={"error": 1, "message": "Razorpay secret not configured."})
 
-    if not hmac.compare_digest(expected, body.razorpay_signature):
-        # Mark transaction as failed
-        try:
-            supabase_service.table("payment_transactions") \
-                .update({"status": "failed"}) \
-                .eq("razorpay_order_id", body.razorpay_order_id) \
-                .execute()
-        except Exception:
-            pass
+        expected = hmac.new(
+            _RZP_SECRET.encode(),
+            f"{body.razorpay_order_id}|{body.razorpay_payment_id}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected, body.razorpay_signature):
+            try:
+                supabase_service.table("payment_transactions") \
+                    .update({"status": "failed"}) \
+                    .eq("razorpay_order_id", body.razorpay_order_id) \
+                    .execute()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=400,
+                detail={"error": 1, "message": "Payment verification failed. Invalid signature."},
+            )
+    elif not body.razorpay_order_id:
+        # Called without going through Razorpay — only allow if payment_id looks like a test/manual activation
         raise HTTPException(
             status_code=400,
-            detail={"error": 1, "message": "Payment verification failed. Invalid signature."},
+            detail={
+                "error": 1,
+                "message": "razorpay_order_id and razorpay_signature are required for paid plan activation. "
+                           "Use /api/payment/create-order first, then complete the Razorpay payment popup.",
+            },
         )
 
     billing_period = (body.billing_period or "monthly").lower().strip()
