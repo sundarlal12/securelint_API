@@ -149,28 +149,6 @@ def _send_payment_email(email: str, plan_name: str, billing_period: str,
         pass  # Email is best-effort; never block payment flow
 
 
-# ── GET /api/payment/key ──────────────────────────────────────────────────────
-@router.get("/payment/key")
-def get_rzp_key():
-    if not _RZP_KEY_ID:
-        raise HTTPException(status_code=500, detail={"error": 1, "message": "Razorpay not configured."})
-    return {"error": 0, "key_id": _RZP_KEY_ID}
-
-
-# ── GET /api/payment/debug ────────────────────────────────────────────────────
-# Shows config status — remove or protect this before going to production
-@router.get("/payment/debug")
-def payment_debug():
-    """Quick health-check: shows whether Razorpay keys are loaded (never exposes the actual secrets)."""
-    return {
-        "razorpay_key_id_set":     bool(_RZP_KEY_ID),
-        "razorpay_key_id_prefix":  _RZP_KEY_ID[:12] + "…" if _RZP_KEY_ID else None,
-        "razorpay_key_is_live":    _RZP_KEY_ID.startswith("rzp_live_") if _RZP_KEY_ID else False,
-        "razorpay_secret_set":     bool(_RZP_SECRET),
-        "razorpay_secret_is_placeholder": _RZP_SECRET == "PASTE_YOUR_LIVE_SECRET_HERE",
-        "supabase_service_key_set": bool(_SERVICE_KEY),
-        "resend_key_set":          bool(_RESEND_KEY),
-    }
 
 
 # ── POST /api/payment/create-order ───────────────────────────────────────────
