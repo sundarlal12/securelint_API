@@ -27,7 +27,7 @@ def get_settings(user=Depends(verify_supabase_jwt)):
         # auto-create default settings (all features off for new users)
         default = {
             "user_id":                   user_id,
-            "Plans":                     "free",
+            "Plans":                     None,
             "enable_detection":          False,
             "auto_mask_critical":        False,
             "show_notifications":        False,
