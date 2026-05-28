@@ -50,6 +50,7 @@ origins = [
     "http://localhost:8000",
     # production
     "https://securelint.app",
+    "https://vaptlabs.com",
     "https://securelint.in",
     "https://www.securelint.in",
     # Netlify deployments (main + preview branches)
