@@ -36,440 +36,122 @@ def _send_lead_notification(name: str, email_id: str, phone: str,
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>VAPTLabs Lead Notification</title>
 </head>
-
-<body style="
-  margin:0;
-  padding:40px 0;
-  background:#eef2f7;
-  font-family:Arial,Helvetica,sans-serif;
-">
-
+<body style="margin:0;padding:40px 0;background:#eef2f7;font-family:Arial,Helvetica,sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0">
-    <tr>
-      <td align="center">
+    <tr><td align="center">
 
-        <!-- Main Container -->
-        <table width="720" cellpadding="0" cellspacing="0"
-          style="
-          background:#ffffff;
-          border-radius:28px;
-          overflow:hidden;
-          box-shadow:0 10px 35px rgba(15,23,42,0.08);
-        ">
+      <table width="720" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:28px;overflow:hidden;box-shadow:0 10px 35px rgba(15,23,42,0.08);">
 
-          <!-- Header -->
-          <tr>
-            <td style="padding:42px 50px 24px 50px;">
+        <!-- Header -->
+        <tr><td style="padding:42px 50px 24px 50px;">
+          <img src="https://ik.imagekit.io/5biqvaptlabsnfbqw/vaptlabs1.png?updatedAt=1746055025044"
+            alt="VAPTLabs" width="220" style="display:block;" />
+        </td></tr>
 
-              <!-- Logo -->
-              <img
-                src="https://ik.imagekit.io/5biqvaptlabsnfbqw/vaptlabs1.png?updatedAt=1746055025044"
-                alt="VAPTLabs"
-                width="220"
-                style="display:block;"
-              />
+        <!-- Badge -->
+        <tr><td style="padding:0 50px;">
+          <div style="display:inline-block;background:#fff1f2;color:#dc2626;padding:12px 22px;border-radius:999px;font-size:14px;font-weight:500;">
+            🛡️ Best VAPT Testing Service Provider in India
+          </div>
+        </td></tr>
 
+        <!-- Lead Notification -->
+        <tr><td style="padding:24px 50px 8px 50px;">
+          <div style="background:#fff7ed;border:1px solid #fed7aa;color:#c2410c;padding:16px 20px;border-radius:16px;font-size:14px;line-height:1.8;">
+            A new VAPT service inquiry has been submitted through the VAPTLabs website.
+            Please review the lead details and contact the client.
+          </div>
+        </td></tr>
+
+        <!-- Contact Information -->
+        <tr><td style="padding:24px 50px 42px 50px;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0 18px;">
+
+            <!-- Full Name -->
+            <tr>
+              <td width="190" style="background:#f8fafc;padding:18px 22px;border-radius:16px 0 0 16px;color:#e11d48;font-weight:700;font-size:15px;border:1px solid #e5e7eb;vertical-align:top;">Full Name</td>
+              <td style="background:#ffffff;padding:18px 22px;border-radius:0 16px 16px 0;border:1px solid #e5e7eb;">
+                <div style="max-width:420px;overflow-x:auto;white-space:nowrap;color:#0f172a;font-size:15px;">{name}</div>
+              </td>
+            </tr>
+
+            <!-- Email -->
+            <tr>
+              <td style="background:#f8fafc;padding:18px 22px;border-radius:16px 0 0 16px;color:#e11d48;font-weight:700;font-size:15px;border:1px solid #e5e7eb;vertical-align:top;">Email Address</td>
+              <td style="background:#ffffff;padding:18px 22px;border-radius:0 16px 16px 0;border:1px solid #e5e7eb;">
+                <div style="max-width:420px;overflow-x:auto;white-space:nowrap;color:#0f172a;font-size:15px;">{email_id}</div>
+              </td>
+            </tr>
+
+            <!-- Phone -->
+            <tr>
+              <td style="background:#f8fafc;padding:18px 22px;border-radius:16px 0 0 16px;color:#e11d48;font-weight:700;font-size:15px;border:1px solid #e5e7eb;vertical-align:top;">Phone Number</td>
+              <td style="background:#ffffff;padding:18px 22px;border-radius:0 16px 16px 0;border:1px solid #e5e7eb;">
+                <div style="max-width:420px;overflow-x:auto;white-space:nowrap;color:#0f172a;font-size:15px;">{phone or "—"}</div>
+              </td>
+            </tr>
+
+            <!-- Company -->
+            <tr>
+              <td style="background:#f8fafc;padding:18px 22px;border-radius:16px 0 0 16px;color:#e11d48;font-weight:700;font-size:15px;border:1px solid #e5e7eb;vertical-align:top;">Company</td>
+              <td style="background:#ffffff;padding:18px 22px;border-radius:0 16px 16px 0;border:1px solid #e5e7eb;">
+                <div style="max-width:420px;overflow-x:auto;white-space:nowrap;color:#0f172a;font-size:15px;">{company or "—"}</div>
+              </td>
+            </tr>
+
+            <!-- Services -->
+            <tr>
+              <td style="background:#f8fafc;padding:18px 22px;border-radius:16px 0 0 16px;color:#e11d48;font-weight:700;font-size:15px;border:1px solid #e5e7eb;vertical-align:top;">Requested Services</td>
+              <td style="background:#ffffff;padding:18px 22px;border-radius:0 16px 16px 0;border:1px solid #e5e7eb;">
+                <div style="max-width:420px;overflow:auto;word-break:break-word;white-space:pre-wrap;color:#0f172a;font-size:15px;line-height:1.8;">{services or "—"}</div>
+              </td>
+            </tr>
+
+            <!-- Message -->
+            <tr>
+              <td style="background:#f8fafc;padding:18px 22px;border-radius:16px 0 0 16px;color:#e11d48;font-weight:700;font-size:15px;border:1px solid #e5e7eb;vertical-align:top;">Message</td>
+              <td style="background:#ffffff;padding:18px 22px;border-radius:0 16px 16px 0;border:1px solid #e5e7eb;">
+                <div style="max-width:420px;overflow:auto;word-break:break-word;white-space:pre-wrap;color:#0f172a;font-size:15px;line-height:1.9;">{message}</div>
+              </td>
+            </tr>
+
+          </table>
+        </td></tr>
+
+        <!-- Compact CTA Buttons -->
+        <tr><td style="padding:0 50px 42px 50px;">
+          <table cellpadding="0" cellspacing="0"><tr>
+            <td>
+              <a href="mailto:{email_id}" style="display:inline-block;background:#be123c;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:10px;font-size:14px;font-weight:600;line-height:1;">
+                Reply to Client
+              </a>
             </td>
-          </tr>
-
-          <!-- Badge -->
-          <tr>
-            <td style="padding:0 50px;">
-
-              <div style="
-                display:inline-block;
-                background:#fff1f2;
-                color:#dc2626;
-                padding:12px 22px;
-                border-radius:999px;
-                font-size:14px;
-                font-weight:500;
-              ">
-                🛡️ Best VAPT Testing Service Provider in India
-              </div>
-
+            <td width="12"></td>
+            <td>
+              <a href="https://vaptlabs.com" style="display:inline-block;background:#ffffff;color:#0f172a;text-decoration:none;padding:12px 20px;border-radius:10px;font-size:14px;font-weight:600;line-height:1;border:1px solid #d1d5db;">
+                Open Website
+              </a>
             </td>
-          </tr>
+          </tr></table>
+        </td></tr>
 
-          <!-- Lead Notification -->
-          <tr>
-            <td style="padding:24px 50px 8px 50px;">
-
-              <div style="
-                background:#fff7ed;
-                border:1px solid #fed7aa;
-                color:#c2410c;
-                padding:16px 20px;
-                border-radius:16px;
-                font-size:14px;
-                line-height:1.8;
-              ">
-                A new VAPT service inquiry has been submitted through the
-                VAPTLabs website. Please review the lead details and contact
-                the client.
-              </div>
-
+        <!-- Footer -->
+        <tr><td style="padding:28px 50px;background:#f8fafc;border-top:1px solid #e5e7eb;">
+          <table width="100%"><tr>
+            <td align="left">
+              <p style="margin:0;color:#0f172a;font-size:15px;font-weight:700;">VAPTLabs</p>
+              <p style="margin:8px 0 0 0;color:#64748b;font-size:13px;">Website Lead Notification</p>
             </td>
-          </tr>
-
-          <!-- Contact Information -->
-          <tr>
-            <td style="padding:24px 50px 42px 50px;">
-
-              <table width="100%" cellpadding="0" cellspacing="0"
-                style="border-collapse:separate;border-spacing:0 18px;">
-
-                <!-- Full Name -->
-                <tr>
-
-                  <td width="190"
-                    style="
-                    background:#f8fafc;
-                    padding:18px 22px;
-                    border-radius:16px 0 0 16px;
-                    color:#e11d48;
-                    font-weight:700;
-                    font-size:15px;
-                    border:1px solid #e5e7eb;
-                    vertical-align:top;
-                  ">
-                    Full Name
-                  </td>
-
-                  <td
-                    style="
-                    background:#ffffff;
-                    padding:18px 22px;
-                    border-radius:0 16px 16px 0;
-                    border:1px solid #e5e7eb;
-                  ">
-
-                    <div style="
-                      max-width:420px;
-                      overflow-x:auto;
-                      white-space:nowrap;
-                      color:#0f172a;
-                      font-size:15px;
-                    ">
-                      {{name}}
-                    </div>
-
-                  </td>
-
-                </tr>
-
-                <!-- Email -->
-                <tr>
-
-                  <td
-                    style="
-                    background:#f8fafc;
-                    padding:18px 22px;
-                    border-radius:16px 0 0 16px;
-                    color:#e11d48;
-                    font-weight:700;
-                    font-size:15px;
-                    border:1px solid #e5e7eb;
-                    vertical-align:top;
-                  ">
-                    Email Address
-                  </td>
-
-                  <td
-                    style="
-                    background:#ffffff;
-                    padding:18px 22px;
-                    border-radius:0 16px 16px 0;
-                    border:1px solid #e5e7eb;
-                  ">
-
-                    <div style="
-                      max-width:420px;
-                      overflow-x:auto;
-                      white-space:nowrap;
-                      color:#0f172a;
-                      font-size:15px;
-                    ">
-                      {{emailId}}
-                    </div>
-
-                  </td>
-
-                </tr>
-
-                <!-- Phone -->
-                <tr>
-
-                  <td
-                    style="
-                    background:#f8fafc;
-                    padding:18px 22px;
-                    border-radius:16px 0 0 16px;
-                    color:#e11d48;
-                    font-weight:700;
-                    font-size:15px;
-                    border:1px solid #e5e7eb;
-                    vertical-align:top;
-                  ">
-                    Phone Number
-                  </td>
-
-                  <td
-                    style="
-                    background:#ffffff;
-                    padding:18px 22px;
-                    border-radius:0 16px 16px 0;
-                    border:1px solid #e5e7eb;
-                  ">
-
-                    <div style="
-                      max-width:420px;
-                      overflow-x:auto;
-                      white-space:nowrap;
-                      color:#0f172a;
-                      font-size:15px;
-                    ">
-                      {{phone}}
-                    </div>
-
-                  </td>
-
-                </tr>
-
-                <!-- Company -->
-                <tr>
-
-                  <td
-                    style="
-                    background:#f8fafc;
-                    padding:18px 22px;
-                    border-radius:16px 0 0 16px;
-                    color:#e11d48;
-                    font-weight:700;
-                    font-size:15px;
-                    border:1px solid #e5e7eb;
-                    vertical-align:top;
-                  ">
-                    Company
-                  </td>
-
-                  <td
-                    style="
-                    background:#ffffff;
-                    padding:18px 22px;
-                    border-radius:0 16px 16px 0;
-                    border:1px solid #e5e7eb;
-                  ">
-
-                    <div style="
-                      max-width:420px;
-                      overflow-x:auto;
-                      white-space:nowrap;
-                      color:#0f172a;
-                      font-size:15px;
-                    ">
-                      {{company}}
-                    </div>
-
-                  </td>
-
-                </tr>
-
-                <!-- Services -->
-                <tr>
-
-                  <td
-                    style="
-                    background:#f8fafc;
-                    padding:18px 22px;
-                    border-radius:16px 0 0 16px;
-                    color:#e11d48;
-                    font-weight:700;
-                    font-size:15px;
-                    border:1px solid #e5e7eb;
-                    vertical-align:top;
-                  ">
-                    Requested Services
-                  </td>
-
-                  <td
-                    style="
-                    background:#ffffff;
-                    padding:18px 22px;
-                    border-radius:0 16px 16px 0;
-                    border:1px solid #e5e7eb;
-                  ">
-
-                    <div style="
-                      max-width:420px;
-                      overflow:auto;
-                      word-break:break-word;
-                      white-space:pre-wrap;
-                      color:#0f172a;
-                      font-size:15px;
-                      line-height:1.8;
-                    ">
-                      {{services}}
-                    </div>
-
-                  </td>
-
-                </tr>
-
-                <!-- Message -->
-                <tr>
-
-                  <td
-                    style="
-                    background:#f8fafc;
-                    padding:18px 22px;
-                    border-radius:16px 0 0 16px;
-                    color:#e11d48;
-                    font-weight:700;
-                    font-size:15px;
-                    border:1px solid #e5e7eb;
-                    vertical-align:top;
-                  ">
-                    Message
-                  </td>
-
-                  <td
-                    style="
-                    background:#ffffff;
-                    padding:18px 22px;
-                    border-radius:0 16px 16px 0;
-                    border:1px solid #e5e7eb;
-                  ">
-
-                    <div style="
-                      max-width:420px;
-                      overflow:auto;
-                      word-break:break-word;
-                      white-space:pre-wrap;
-                      color:#0f172a;
-                      font-size:15px;
-                      line-height:1.9;
-                    ">
-                      {{message}}
-                    </div>
-
-                  </td>
-
-                </tr>
-
-              </table>
-
+            <td align="right">
+              <p style="margin:0;color:#94a3b8;font-size:12px;">Auto Generated Email</p>
             </td>
-          </tr>
+          </tr></table>
+        </td></tr>
 
-          <!-- Compact CTA Buttons -->
-          <tr>
-            <td style="padding:0 50px 42px 50px;">
+      </table>
 
-              <table cellpadding="0" cellspacing="0">
-                <tr>
-
-                  <!-- Reply Button -->
-                  <td>
-                    <a href="mailto:{{emailId}}"
-                      style="
-                      display:inline-block;
-                      background:#be123c;
-                      color:#ffffff;
-                      text-decoration:none;
-                      padding:12px 20px;
-                      border-radius:10px;
-                      font-size:14px;
-                      font-weight:600;
-                      line-height:1;
-                    ">
-                      Reply to Client
-                    </a>
-                  </td>
-
-                  <td width="12"></td>
-
-                  <!-- Website Button -->
-                  <td>
-                    <a href="https://vaptlabs.com"
-                      style="
-                      display:inline-block;
-                      background:#ffffff;
-                      color:#0f172a;
-                      text-decoration:none;
-                      padding:12px 20px;
-                      border-radius:10px;
-                      font-size:14px;
-                      font-weight:600;
-                      line-height:1;
-                      border:1px solid #d1d5db;
-                    ">
-                      Open Website
-                    </a>
-                  </td>
-
-                </tr>
-              </table>
-
-            </td>
-          </tr>
-
-          <!-- Footer -->
-          <tr>
-            <td style="
-              padding:28px 50px;
-              background:#f8fafc;
-              border-top:1px solid #e5e7eb;
-            ">
-
-              <table width="100%">
-                <tr>
-
-                  <td align="left">
-
-                    <p style="
-                      margin:0;
-                      color:#0f172a;
-                      font-size:15px;
-                      font-weight:700;
-                    ">
-                      VAPTLabs
-                    </p>
-
-                    <p style="
-                      margin:8px 0 0 0;
-                      color:#64748b;
-                      font-size:13px;
-                    ">
-                      Website Lead Notification
-                    </p>
-
-                  </td>
-
-                  <td align="right">
-
-                    <p style="
-                      margin:0;
-                      color:#94a3b8;
-                      font-size:12px;
-                    ">
-                      Auto Generated Email
-                    </p>
-
-                  </td>
-
-                </tr>
-              </table>
-
-            </td>
-          </tr>
-
-        </table>
-
-      </td>
-    </tr>
+    </td></tr>
   </table>
-
 </body>
 </html>"""
 
