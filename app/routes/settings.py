@@ -7,76 +7,15 @@ from fastapi import APIRouter, Depends, Body
 from supabase import create_client
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 from app.core.supabase_jwt import verify_supabase_jwt
-from fastapi import HTTPException, Depends
+
 router = APIRouter()
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-
-# @router.get("/settings")
-# def get_settings(user=Depends(verify_supabase_jwt)):
-#     user_id = user["sub"]
-
-#     res = (
-#         supabase
-#         .table("user_settings")
-#         .select("*")
-#         .eq("user_id", user_id)
-#         .execute()
-#     )
-
-#     if not res.data:
-#         # auto-create default settings (all features off for new users)
-#         default = {
-#             "user_id":                   user_id,
-#             "Plans":                     None,
-#             "enable_detection":          False,
-#             "auto_mask_critical":        False,
-#             "show_notifications":        False,
-#             "mask_console":              False,
-#             "scan_large_docs":           False,
-#             "realtime_updates":          False,
-#             "show_risk_score":           False,
-#             "show_recent_activity":      False,
-#             "animated_charts":           False,
-#             "auto_refresh":              False,
-#             "preserve_context":          False,
-#             "auto_mask_textareas":       False,
-#             "auto_mask_inputs":          False,
-#             "overlay_input":             False,
-#             "overlay_textarea":          False,
-#             "overlay_editor":            False,
-#             "block_network_secrets":     False,
-#             "block_form_submission":     False,
-#             "aggressive_email_blocking": False,
-#             "detect_critical":           False,
-#             "detect_high":               False,
-#             "detect_medium":             False,
-#             "detect_low":                False,
-#             "notify_critical":           False,
-#             "notify_high":               False,
-#         }
-#         supabase.table("user_settings").insert(default).execute()
-#         return default
-
-#     return res.data[0]
-
-
 
 
 @router.get("/settings")
 def get_settings(user=Depends(verify_supabase_jwt)):
     user_id = user["sub"]
 
-    # Validate user still exists
-    auth_user = supabase.auth.admin.get_user_by_id(user_id)
-
-    if not auth_user or not auth_user.user:
-        raise HTTPException(
-            status_code=401,
-            detail="User does not exist or account was deleted"
-        )
-
-    # Get settings
     res = (
         supabase
         .table("user_settings")
@@ -86,7 +25,7 @@ def get_settings(user=Depends(verify_supabase_jwt)):
     )
 
     if not res.data:
-        # auto-create default settings
+        # auto-create default settings (all features off for new users)
         default = {
             "user_id":                   user_id,
             "Plans":                     None,
@@ -116,18 +55,11 @@ def get_settings(user=Depends(verify_supabase_jwt)):
             "notify_critical":           False,
             "notify_high":               False,
         }
-
-        try:
-            supabase.table("user_settings").insert(default).execute()
-        except Exception:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to create user settings"
-            )
-
+        supabase.table("user_settings").insert(default).execute()
         return default
 
     return res.data[0]
+
 
 
 # @router.put("/settings")
