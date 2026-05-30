@@ -9,47 +9,140 @@ from app.core.supabase_jwt import verify_supabase_jwt
 router = APIRouter()
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-# Service-role client bypasses RLS — used for org_id lookups across tables
+# Service-role client bypasses RLS — needed to query organizations table
 _SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 supabase_service = create_client(SUPABASE_URL, _SERVICE_KEY) if _SERVICE_KEY else supabase
 
-
-def _get_org_id_for_enterprise_user(user_id: str) -> Optional[str]:
-    """
-    Returns org_id if the user is on an active enterprise plan and is a member
-    of an organization. Returns None for free/pro users — no error is raised
-    because incidents are valid for all plan types.
-    """
-    sub_res = (
-        supabase_service
-        .table("user_subscriptions")
-        .select("plan_id, status")
-        .eq("user_id", user_id)
-        .execute()
-    )
-
-    if not sub_res.data:
-        return None
-
-    sub = sub_res.data[0]
-    if sub.get("plan_id") != "enterprise" or sub.get("status") != "active":
-        return None
-
-    org_res = (
-        supabase_service
-        .table("organization_members")
-        .select("org_id")
-        .eq("user_id", user_id)
-        .execute()
-    )
-
-    if not org_res.data:
-        return None
-
-    return org_res.data[0].get("org_id")
-
-
 EXTENSION_INCIDENT_TYPE = "extension_type"
+
+# Free/consumer email domains — never treated as business domains
+_FREE_DOMAINS = {
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com",
+    "protonmail.com", "aol.com", "live.com", "msn.com", "me.com",
+    "mail.com", "inbox.com", "yandex.com", "zoho.com",
+}
+
+
+def _get_org_id_by_email_domain(user_email: str) -> Optional[str]:
+    """
+    Checks the organizations table for an active org whose org_domains array
+    contains the domain portion of user_email.
+
+    Returns the org id (str) if found and active, otherwise None.
+    organizations schema: id, name, billing_email, created_by, created_at, org_domains (text[]), status
+    """
+    if not user_email or "@" not in user_email:
+        return None
+
+    domain = user_email.split("@", 1)[1].lower().strip()
+
+    if domain in _FREE_DOMAINS:
+        return None
+
+    try:
+        # org_domains is a text[] column; PostgREST cs (contains) operator checks
+        # whether the array contains the given element.
+        res = (
+            supabase_service
+            .table("organizations")
+            .select("id, status")
+            .filter("org_domains", "cs", f'{{"{domain}"}}')
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return None
+
+    if not res.data:
+        return None
+
+    org = res.data[0]
+
+    if org.get("status") is not True:
+        return None
+
+    return str(org["id"])
+
+
+def _has_active_enterprise_subscription(user_id: str) -> bool:
+    """
+    Returns True only if the user has an active enterprise plan
+    in user_subscriptions, otherwise False.
+    """
+    try:
+        res = (
+            supabase_service
+            .table("user_subscriptions")
+            .select("plan_id, status")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return False
+
+    if not res.data:
+        return False
+
+    sub = res.data[0]
+    return (
+        sub.get("plan_id") == "enterprise"
+        and sub.get("status") == "active"
+    )
+
+
+def _resolve_enterprise(user_id: str, user_email: str) -> Optional[str]:
+    """
+    Returns org_id only when BOTH conditions are satisfied:
+      1. user_subscriptions has an active enterprise plan for this user
+      2. the user's email domain matches an active org in organizations
+
+    If either check fails → returns None (normal incidents table used).
+    """
+    if not _has_active_enterprise_subscription(user_id):
+        return None
+
+    return _get_org_id_by_email_domain(user_email)
+
+
+def _build_base_row(
+    user_id: str,
+    user_email: str,
+    data: "IncidentRequest",
+    org_id: Optional[str],
+    *,
+    secret_type: str,
+    severity: str,
+    masked_preview: str,
+    action: str,
+    tab_url: str,
+    tab_title: str,
+    timestamp: str,
+    extra: Optional[Dict[str, Any]] = None,
+    extensions: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "user_id":           user_id,
+        "user_email":        user_email,
+        "browser_id":        data.browserId,
+        "extension_version": data.extensionVersion,
+        "secret_type":       secret_type,
+        "severity":          severity,
+        "masked_preview":    masked_preview,
+        "action":            action,
+        "tab_url":           tab_url,
+        "tab_title":         tab_title,
+        "timestamp":         timestamp,
+    }
+    if data.browserInfo:
+        row["browser_info"] = data.browserInfo
+    if org_id:
+        row["org_id"] = org_id
+    if extra:
+        row["extra"] = extra
+    if extensions:
+        row["extensions"] = extensions
+    return row
 
 
 class MaskedSecret(BaseModel):
@@ -57,7 +150,6 @@ class MaskedSecret(BaseModel):
     severity: str
     maskedPreview: str
     action: str
-    # Phishing / site-safety fields — stored inside extra, not as separate columns
     status: Optional[str] = None   # 'safe' | 'suspicious' | 'unsafe' | 'danger'
     score: Optional[int] = None    # 0–100 trust score
 
@@ -65,19 +157,14 @@ class MaskedSecret(BaseModel):
 class IncidentRequest(BaseModel):
     browserId: str
     extensionVersion: str
-    # Browser metadata — stored as jsonb in browser_info column
     browserInfo: Optional[Dict[str, Any]] = None
-    # Required for all types except extension_type
     tabUrl: Optional[str] = None
     tabTitle: Optional[str] = None
     timestamp: Optional[str] = None
     maskedSecrets: Optional[List[MaskedSecret]] = None
-    # Incident type — drives routing logic
-    type: Optional[str] = None      # 'phishing' | 'url_visit' | 'extension_type'
-    domain: Optional[str] = None    # already present in tabUrl; kept for convenience
-    # extension_type payloads: permissions, metadata, etc. → extensions jsonb column
+    type: Optional[str] = None      # 'phishing' | 'url_visit' | 'extension_type' | etc.
+    domain: Optional[str] = None
     extensions: Optional[Dict[str, Any]] = None
-    # Full layer breakdown for non-extension types → extra jsonb column
     extra: Optional[Dict[str, Any]] = None
 
 
@@ -89,55 +176,47 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
     if not user_id:
         raise HTTPException(
             status_code=401,
-            detail="Auth token is missing or invalid: no user ID found"
+            detail="Auth token is missing or invalid: no user ID found",
         )
-
     if not user_email:
         raise HTTPException(
             status_code=401,
-            detail="Auth token is missing or invalid: no email found in token"
+            detail="Auth token is missing or invalid: no email found in token",
         )
 
-    # Resolve org_id for enterprise users; None for free/pro users
-    org_id = _get_org_id_for_enterprise_user(user_id)
+    # Determine which table to write to based on email domain → organizations lookup
+    org_id = _resolve_enterprise(user_id, user_email)
+    target_table = "incidents_enterprise" if org_id else "incidents"
 
     # ── extension_type incident ──────────────────────────────────────────────
     if data.type == EXTENSION_INCIDENT_TYPE:
-        row: Dict[str, Any] = {
-            "user_id":           user_id,
-            "user_email":        user_email,
-            "browser_id":        data.browserId,
-            "extension_version": data.extensionVersion,
-            "secret_type":       EXTENSION_INCIDENT_TYPE,
-            "tab_url":           data.tabUrl   or "chrome://extensions/",
-            "tab_title":         data.tabTitle or "extension_report",
-            "timestamp":         data.timestamp or "",
-            "severity":          "info",
-            "masked_preview":    "extension_report",
-            "action":            "sync",
-        }
-
-        if data.browserInfo:
-            row["browser_info"] = data.browserInfo
-
-        if org_id:
-            row["org_id"] = org_id
-
-        # Store all extension-specific data (permissions, metadata, etc.)
-        if data.extensions:
-            row["extensions"] = data.extensions
+        row = _build_base_row(
+            user_id=user_id,
+            user_email=user_email,
+            data=data,
+            org_id=org_id,
+            secret_type=EXTENSION_INCIDENT_TYPE,
+            severity="info",
+            masked_preview="extension_report",
+            action="sync",
+            tab_url=data.tabUrl or "chrome://extensions/",
+            tab_title=data.tabTitle or "extension_report",
+            timestamp=data.timestamp or "",
+            extensions=data.extensions,
+        )
 
         try:
-            res = supabase.table("incidents").insert([row]).execute()
+            res = supabase_service.table(target_table).insert([row]).execute()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to log incident: {str(e)}")
 
         return {
             "success": True,
             "inserted": len(res.data) if res.data else 0,
+            "table": target_table,
         }
 
-    # ── all other incident types ─────────────────────────────────────────────
+    # ── all other incident types (secret_mask, phishing, url_visit, dlp, email, etc.)
     if not data.tabUrl:
         raise HTTPException(status_code=400, detail="tabUrl is required for this incident type")
     if not data.tabTitle:
@@ -149,50 +228,35 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
 
     rows = []
     for secret in data.maskedSecrets:
-        # Build the extra jsonb payload.
-        # Start with whatever the extension sent in data.extra, then surface the
-        # site_status and site_score from maskedSecrets into it so they are always
-        # present in the single extra column — no new table columns needed.
         extra_payload: Dict[str, Any] = dict(data.extra) if data.extra else {}
-
         if secret.status is not None:
             extra_payload["site_status"] = secret.status
         if secret.score is not None:
             extra_payload["site_score"] = secret.score
 
-        incident_row: Dict[str, Any] = {
-            "user_id":           user_id,
-            "user_email":        user_email,
-            "browser_id":        data.browserId,
-            "tab_url":           data.tabUrl,
-            "tab_title":         data.tabTitle,
-            "secret_type":       secret.type,
-            "severity":          secret.severity,
-            "masked_preview":    secret.maskedPreview,
-            "action":            secret.action,
-            "timestamp":         data.timestamp,
-            "extension_version": data.extensionVersion,
-        }
-
-        if data.browserInfo:
-            incident_row["browser_info"] = data.browserInfo
-
-        # Stamp org_id only for enterprise users so admin dashboard can filter by org
-        if org_id:
-            incident_row["org_id"] = org_id
-
-        # Only write extra when there is something to store
-        if extra_payload:
-            incident_row["extra"] = extra_payload
-
-        rows.append(incident_row)
+        row = _build_base_row(
+            user_id=user_id,
+            user_email=user_email,
+            data=data,
+            org_id=org_id,
+            secret_type=secret.type,
+            severity=secret.severity,
+            masked_preview=secret.maskedPreview,
+            action=secret.action,
+            tab_url=data.tabUrl,
+            tab_title=data.tabTitle,
+            timestamp=data.timestamp,
+            extra=extra_payload or None,
+        )
+        rows.append(row)
 
     try:
-        res = supabase.table("incidents").insert(rows).execute()
+        res = supabase_service.table(target_table).insert(rows).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to log incident: {str(e)}")
 
     return {
         "success": True,
         "inserted": len(res.data) if res.data else 0,
+        "table": target_table,
     }
