@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 from supabase import create_client
@@ -21,6 +22,13 @@ _FREE_DOMAINS = {
     "protonmail.com", "aol.com", "live.com", "msn.com", "me.com",
     "mail.com", "inbox.com", "yandex.com", "zoho.com",
 }
+
+
+def _err(status: int, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"success": False, "inserted": 0, "detail": message},
+    )
 
 
 def _get_org_id_by_email_domain(user_email: str) -> Optional[str]:
@@ -129,15 +137,9 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
     user_email = user.get("email")
 
     if not user_id:
-        raise HTTPException(
-            status_code=401,
-            detail={"success": False, "inserted": 0, "detail": "Auth token is missing or invalid: no user ID found"},
-        )
+        return _err(401, "Auth token is missing or invalid: no user ID found")
     if not user_email:
-        raise HTTPException(
-            status_code=401,
-            detail={"success": False, "inserted": 0, "detail": "Auth token is missing or invalid: no email found in token"},
-        )
+        return _err(401, "Auth token is missing or invalid: no email found in token")
 
     # Gate: only active enterprise subscribers may log incidents
     try:
@@ -150,25 +152,16 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
             .execute()
         )
     except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail={"success": False, "inserted": 0, "detail": "Failed to verify subscription"},
-        )
+        return _err(500, "Failed to verify subscription")
 
     if not sub_res.data:
-        raise HTTPException(
-            status_code=403,
-            detail={"success": False, "inserted": 0, "detail": "No subscription found. Access denied."},
-        )
+        return _err(403, "No subscription found. Access denied.")
 
     sub = sub_res.data[0]
     if sub.get("plan_id") != "enterprise" or sub.get("status") != "active":
-        raise HTTPException(
-            status_code=403,
-            detail={"success": False, "inserted": 0, "detail": "Active enterprise subscription required to log incidents."},
-        )
+        return _err(403, "Active enterprise subscription required to log incidents.")
 
-    # Resolve org_id from email domain — stamped on row for dashboard filtering.
+    # Resolve org_id from email domain — stamped on row for dashboard filtering
     org_id = _get_org_id_by_email_domain(user_email)
 
     # ── extension_type incident ──────────────────────────────────────────────
@@ -191,37 +184,19 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
         try:
             res = supabase_service.table("incidents").insert([row]).execute()
         except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail={"success": False, "inserted": 0, "detail": f"Failed to log incident: {str(e)}"},
-            )
+            return _err(500, f"Failed to log incident: {str(e)}")
 
-        return {
-            "success": True,
-            "inserted": len(res.data) if res.data else 0,
-        }
+        return {"success": True, "inserted": len(res.data) if res.data else 0}
 
     # ── all other incident types (secret_mask, phishing, url_visit, dlp, email, etc.)
     if not data.tabUrl:
-        raise HTTPException(
-            status_code=400,
-            detail={"success": False, "inserted": 0, "detail": "tabUrl is required for this incident type"},
-        )
+        return _err(400, "tabUrl is required for this incident type")
     if not data.tabTitle:
-        raise HTTPException(
-            status_code=400,
-            detail={"success": False, "inserted": 0, "detail": "tabTitle is required for this incident type"},
-        )
+        return _err(400, "tabTitle is required for this incident type")
     if not data.timestamp:
-        raise HTTPException(
-            status_code=400,
-            detail={"success": False, "inserted": 0, "detail": "timestamp is required for this incident type"},
-        )
+        return _err(400, "timestamp is required for this incident type")
     if not data.maskedSecrets:
-        raise HTTPException(
-            status_code=400,
-            detail={"success": False, "inserted": 0, "detail": "maskedSecrets cannot be empty"},
-        )
+        return _err(400, "maskedSecrets cannot be empty")
 
     rows = []
     for secret in data.maskedSecrets:
@@ -250,12 +225,6 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
     try:
         res = supabase_service.table("incidents").insert(rows).execute()
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"success": False, "inserted": 0, "detail": f"Failed to log incident: {str(e)}"},
-        )
+        return _err(500, f"Failed to log incident: {str(e)}")
 
-    return {
-        "success": True,
-        "inserted": len(res.data) if res.data else 0,
-    }
+    return {"success": True, "inserted": len(res.data) if res.data else 0}
