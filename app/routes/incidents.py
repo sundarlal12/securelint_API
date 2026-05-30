@@ -99,6 +99,8 @@ def _build_base_row(
     }
     if data.browserInfo:
         row["browser_info"] = data.browserInfo
+    if data.allRecipients:
+        row["recipientDomains"] = data.allRecipients
     if org_id:
         row["org_id"] = org_id
     if extra:
@@ -125,6 +127,7 @@ class IncidentRequest(BaseModel):
     tabTitle: Optional[str] = None
     timestamp: Optional[str] = None
     maskedSecrets: Optional[List[MaskedSecret]] = None
+    allRecipients: Optional[List[Dict[str, Any]]] = None   # email_dlp incidents
     type: Optional[str] = None      # 'phishing' | 'url_visit' | 'extension_type' | etc.
     domain: Optional[str] = None
     extensions: Optional[Dict[str, Any]] = None
