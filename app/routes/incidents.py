@@ -201,9 +201,38 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
     if not data.maskedSecrets:
         return _err(400, "maskedSecrets cannot be empty")
 
+    # ── email_dlp: one row with all masked previews joined by comma ──────────
+    first_secret = data.maskedSecrets[0]
+    if first_secret.type == "email_dlp":
+        combined_preview = ", ".join(s.maskedPreview for s in data.maskedSecrets)
+        extra_payload: Dict[str, Any] = dict(data.extra) if data.extra else {}
+
+        row = _build_base_row(
+            user_id=user_id,
+            user_email=user_email,
+            data=data,
+            org_id=org_id,
+            secret_type="email_dlp",
+            severity=first_secret.severity,
+            masked_preview=combined_preview,
+            action=first_secret.action,
+            tab_url=data.tabUrl,
+            tab_title=data.tabTitle,
+            timestamp=data.timestamp,
+            extra=extra_payload or None,
+        )
+
+        try:
+            res = supabase_service.table("incidents").insert([row]).execute()
+        except Exception as e:
+            return _err(500, f"Failed to log incident: {str(e)}")
+
+        return {"success": True, "inserted": len(res.data) if res.data else 0}
+
+    # ── all other types: one row per secret ──────────────────────────────────
     rows = []
     for secret in data.maskedSecrets:
-        extra_payload: Dict[str, Any] = dict(data.extra) if data.extra else {}
+        extra_payload = dict(data.extra) if data.extra else {}
         if secret.status is not None:
             extra_payload["site_status"] = secret.status
         if secret.score is not None:
