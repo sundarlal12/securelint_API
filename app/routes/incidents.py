@@ -25,11 +25,9 @@ _FREE_DOMAINS = {
 
 def _get_org_id_by_email_domain(user_email: str) -> Optional[str]:
     """
-    Checks the organizations table for an active org whose org_domains array
-    contains the domain portion of user_email.
-
-    Returns the org id (str) if found and active, otherwise None.
-    organizations schema: id, name, billing_email, created_by, created_at, org_domains (text[]), status
+    Looks up the organizations table for an active org whose org_domains
+    array contains the domain portion of user_email.
+    Returns org id (str) if found and active (status=true), otherwise None.
     """
     if not user_email or "@" not in user_email:
         return None
@@ -40,8 +38,6 @@ def _get_org_id_by_email_domain(user_email: str) -> Optional[str]:
         return None
 
     try:
-        # org_domains is a text[] column; PostgREST cs (contains) operator checks
-        # whether the array contains the given element.
         res = (
             supabase_service
             .table("organizations")
@@ -62,47 +58,6 @@ def _get_org_id_by_email_domain(user_email: str) -> Optional[str]:
         return None
 
     return str(org["id"])
-
-
-def _has_active_enterprise_subscription(user_id: str) -> bool:
-    """
-    Returns True only if the user has an active enterprise plan
-    in user_subscriptions, otherwise False.
-    """
-    try:
-        res = (
-            supabase_service
-            .table("user_subscriptions")
-            .select("plan_id, status")
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
-    except Exception:
-        return False
-
-    if not res.data:
-        return False
-
-    sub = res.data[0]
-    return (
-        sub.get("plan_id") == "enterprise"
-        and sub.get("status") == "active"
-    )
-
-
-def _resolve_enterprise(user_id: str, user_email: str) -> Optional[str]:
-    """
-    Returns org_id only when BOTH conditions are satisfied:
-      1. user_subscriptions has an active enterprise plan for this user
-      2. the user's email domain matches an active org in organizations
-
-    If either check fails → returns None (normal incidents table used).
-    """
-    if not _has_active_enterprise_subscription(user_id):
-        return None
-
-    return _get_org_id_by_email_domain(user_email)
 
 
 def _build_base_row(
@@ -184,9 +139,31 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
             detail="Auth token is missing or invalid: no email found in token",
         )
 
-    # Determine which table to write to based on email domain → organizations lookup
-    org_id = _resolve_enterprise(user_id, user_email)
-    target_table = "incidents_enterprise" if org_id else "incidents"
+    # Gate: only active enterprise subscribers may log incidents
+    try:
+        sub_res = (
+            supabase_service
+            .table("user_subscriptions")
+            .select("plan_id, status")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to verify subscription")
+
+    if not sub_res.data:
+        raise HTTPException(status_code=403, detail="No subscription found. Access denied.")
+
+    sub = sub_res.data[0]
+    if sub.get("plan_id") != "enterprise" or sub.get("status") != "active":
+        raise HTTPException(
+            status_code=403,
+            detail="Active enterprise subscription required to log incidents.",
+        )
+
+    # Resolve org_id from email domain — stamped on row for dashboard filtering.
+    org_id = _get_org_id_by_email_domain(user_email)
 
     # ── extension_type incident ──────────────────────────────────────────────
     if data.type == EXTENSION_INCIDENT_TYPE:
@@ -206,14 +183,13 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
         )
 
         try:
-            res = supabase_service.table(target_table).insert([row]).execute()
+            res = supabase_service.table("incidents").insert([row]).execute()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to log incident: {str(e)}")
 
         return {
             "success": True,
             "inserted": len(res.data) if res.data else 0,
-            "table": target_table,
         }
 
     # ── all other incident types (secret_mask, phishing, url_visit, dlp, email, etc.)
@@ -251,12 +227,11 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
         rows.append(row)
 
     try:
-        res = supabase_service.table(target_table).insert(rows).execute()
+        res = supabase_service.table("incidents").insert(rows).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to log incident: {str(e)}")
 
     return {
         "success": True,
         "inserted": len(res.data) if res.data else 0,
-        "table": target_table,
     }
