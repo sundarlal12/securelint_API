@@ -131,12 +131,12 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
     if not user_id:
         raise HTTPException(
             status_code=401,
-            detail="Auth token is missing or invalid: no user ID found",
+            detail={"success": False, "inserted": 0, "detail": "Auth token is missing or invalid: no user ID found"},
         )
     if not user_email:
         raise HTTPException(
             status_code=401,
-            detail="Auth token is missing or invalid: no email found in token",
+            detail={"success": False, "inserted": 0, "detail": "Auth token is missing or invalid: no email found in token"},
         )
 
     # Gate: only active enterprise subscribers may log incidents
@@ -150,16 +150,22 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
             .execute()
         )
     except Exception:
-        raise HTTPException(status_code=500, detail="Failed to verify subscription")
+        raise HTTPException(
+            status_code=500,
+            detail={"success": False, "inserted": 0, "detail": "Failed to verify subscription"},
+        )
 
     if not sub_res.data:
-        raise HTTPException(status_code=403, detail="No subscription found. Access denied.")
+        raise HTTPException(
+            status_code=403,
+            detail={"success": False, "inserted": 0, "detail": "No subscription found. Access denied."},
+        )
 
     sub = sub_res.data[0]
     if sub.get("plan_id") != "enterprise" or sub.get("status") != "active":
         raise HTTPException(
             status_code=403,
-            detail="Active enterprise subscription required to log incidents.",
+            detail={"success": False, "inserted": 0, "detail": "Active enterprise subscription required to log incidents."},
         )
 
     # Resolve org_id from email domain — stamped on row for dashboard filtering.
@@ -185,7 +191,10 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
         try:
             res = supabase_service.table("incidents").insert([row]).execute()
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to log incident: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail={"success": False, "inserted": 0, "detail": f"Failed to log incident: {str(e)}"},
+            )
 
         return {
             "success": True,
@@ -194,13 +203,25 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
 
     # ── all other incident types (secret_mask, phishing, url_visit, dlp, email, etc.)
     if not data.tabUrl:
-        raise HTTPException(status_code=400, detail="tabUrl is required for this incident type")
+        raise HTTPException(
+            status_code=400,
+            detail={"success": False, "inserted": 0, "detail": "tabUrl is required for this incident type"},
+        )
     if not data.tabTitle:
-        raise HTTPException(status_code=400, detail="tabTitle is required for this incident type")
+        raise HTTPException(
+            status_code=400,
+            detail={"success": False, "inserted": 0, "detail": "tabTitle is required for this incident type"},
+        )
     if not data.timestamp:
-        raise HTTPException(status_code=400, detail="timestamp is required for this incident type")
+        raise HTTPException(
+            status_code=400,
+            detail={"success": False, "inserted": 0, "detail": "timestamp is required for this incident type"},
+        )
     if not data.maskedSecrets:
-        raise HTTPException(status_code=400, detail="maskedSecrets cannot be empty")
+        raise HTTPException(
+            status_code=400,
+            detail={"success": False, "inserted": 0, "detail": "maskedSecrets cannot be empty"},
+        )
 
     rows = []
     for secret in data.maskedSecrets:
@@ -229,7 +250,10 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
     try:
         res = supabase_service.table("incidents").insert(rows).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to log incident: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"success": False, "inserted": 0, "detail": f"Failed to log incident: {str(e)}"},
+        )
 
     return {
         "success": True,
