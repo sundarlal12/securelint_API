@@ -65,6 +65,8 @@ class MaskedSecret(BaseModel):
 class IncidentRequest(BaseModel):
     browserId: str
     extensionVersion: str
+    # Browser metadata — stored as jsonb in browser_info column
+    browserInfo: Optional[Dict[str, Any]] = None
     # Required for all types except extension_type
     tabUrl: Optional[str] = None
     tabTitle: Optional[str] = None
@@ -114,6 +116,9 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
             "masked_preview":    "extension_report",
             "action":            "sync",
         }
+
+        if data.browserInfo:
+            row["browser_info"] = data.browserInfo
 
         if org_id:
             row["org_id"] = org_id
@@ -168,6 +173,9 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
             "timestamp":         data.timestamp,
             "extension_version": data.extensionVersion,
         }
+
+        if data.browserInfo:
+            incident_row["browser_info"] = data.browserInfo
 
         # Stamp org_id only for enterprise users so admin dashboard can filter by org
         if org_id:
