@@ -201,29 +201,35 @@ def create_incident(data: IncidentRequest, user=Depends(verify_supabase_jwt)):
     if not data.maskedSecrets:
         return _err(400, "maskedSecrets cannot be empty")
 
-    # ── email_dlp: one row with all masked previews joined by comma ──────────
-    first_secret = data.maskedSecrets[0]
-    if first_secret.type == "email_dlp":
-        combined_preview = ", ".join(s.maskedPreview for s in data.maskedSecrets)
-        extra_payload: Dict[str, Any] = dict(data.extra) if data.extra else {}
+    # ── email_dlp: one row per severity with all masked previews joined by comma
+    if data.type == "email_dlp":
+        # Group maskedSecrets by severity
+        severity_groups: Dict[str, list] = {}
+        for s in data.maskedSecrets:
+            severity_groups.setdefault(s.severity, []).append(s)
 
-        row = _build_base_row(
-            user_id=user_id,
-            user_email=user_email,
-            data=data,
-            org_id=org_id,
-            secret_type="email_dlp",
-            severity=first_secret.severity,
-            masked_preview=combined_preview,
-            action=first_secret.action,
-            tab_url=data.tabUrl,
-            tab_title=data.tabTitle,
-            timestamp=data.timestamp,
-            extra=extra_payload or None,
-        )
+        dlp_rows = []
+        for severity, secrets in severity_groups.items():
+            combined_preview = ", ".join(s.maskedPreview for s in secrets)
+            extra_payload: Dict[str, Any] = dict(data.extra) if data.extra else {}
+
+            dlp_rows.append(_build_base_row(
+                user_id=user_id,
+                user_email=user_email,
+                data=data,
+                org_id=org_id,
+                secret_type="email_dlp",
+                severity=severity,
+                masked_preview=combined_preview,
+                action=secrets[0].action,
+                tab_url=data.tabUrl,
+                tab_title=data.tabTitle,
+                timestamp=data.timestamp,
+                extra=extra_payload or None,
+            ))
 
         try:
-            res = supabase_service.table("incidents").insert([row]).execute()
+            res = supabase_service.table("incidents").insert(dlp_rows).execute()
         except Exception as e:
             return _err(500, f"Failed to log incident: {str(e)}")
 
