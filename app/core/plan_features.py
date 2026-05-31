@@ -15,26 +15,34 @@ _STATIC_FIELDS: Dict[str, Any] = {
 # Columns that are never feature flags (system / metadata columns)
 _SKIP_COLUMNS = {"user_id", "updated_at", "Plans", "created_at"}
 
+# Hardcoded fallback — all boolean columns from user_settings.
+# Used when the get_user_settings_boolean_columns() RPC doesn't exist yet.
+_FALLBACK_BOOLEAN_COLUMNS: Tuple[str, ...] = (
+    "show_risk_score", "show_recent_activity", "animated_charts", "auto_refresh",
+    "enable_detection", "auto_mask_critical", "show_notifications", "mask_console",
+    "scan_large_docs", "realtime_updates", "preserve_context",
+    "auto_mask_textareas", "auto_mask_inputs", "auto_mask_editor",
+    "overlay_input", "overlay_textarea", "overlay_editor",
+    "block_network_secrets", "block_form_submission", "aggressive_email_blocking",
+    "detect_critical", "detect_high", "detect_medium", "detect_low",
+    "notify_critical", "notify_high",
+    "site_exclusions_status", "global_masking_status",
+    "enterprise_data_collection", "email_dlp_enabled",
+    "phish_detection", "link_hover_detection",
+    "phish_detection_alert", "phish_detection_block", "domain_age_alert",
+    "password_breach_data", "extension_scrape_data",
+)
+
 # Module-level cache so we only query the schema once per process startup
 _cached_boolean_columns: Optional[Tuple[str, ...]] = None
 
 
 def _get_all_features(supabase_client) -> Tuple[str, ...]:
     """
-    Returns the tuple of boolean column names from user_settings dynamically
-    by calling the get_user_settings_boolean_columns() Postgres function.
+    Returns the tuple of boolean column names from user_settings.
+    Tries the get_user_settings_boolean_columns() RPC first (dynamic),
+    falls back to the hardcoded list if the RPC doesn't exist yet.
     Result is cached for the lifetime of the process.
-
-    Requires this function to exist in Supabase:
-        CREATE OR REPLACE FUNCTION get_user_settings_boolean_columns()
-        RETURNS TABLE(col_name TEXT) AS $$
-            SELECT column_name::TEXT
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name   = 'user_settings'
-              AND data_type    = 'boolean'
-            ORDER BY ordinal_position;
-        $$ LANGUAGE sql SECURITY DEFINER;
     """
     global _cached_boolean_columns
     if _cached_boolean_columns is not None:
@@ -49,12 +57,13 @@ def _get_all_features(supabase_client) -> Tuple[str, ...]:
                 and row["col_name"] not in _STATIC_FIELDS
             )
             _cached_boolean_columns = cols
-            print(f"[plan_features] loaded {len(cols)} boolean columns from user_settings schema")
+            print(f"[plan_features] loaded {len(cols)} boolean columns from DB schema")
             return _cached_boolean_columns
     except Exception as e:
-        print(f"[plan_features] schema fetch failed, using empty feature set: {e}")
+        print(f"[plan_features] RPC not available, using hardcoded fallback: {e}")
 
-    return ()
+    _cached_boolean_columns = _FALLBACK_BOOLEAN_COLUMNS
+    return _cached_boolean_columns
 
 
 def _fetch_plan_features(plan_id: str, supabase_client) -> List[str]:
