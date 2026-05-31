@@ -409,55 +409,9 @@ def signup(data: SignupRequest):
             _sub_err = f"update exception: {_e2}"
             print(f"[signup] user_subscriptions update exception: {_e2}")
 
-    # ── Default settings row — enabled fields depend on plan tier ────────────
-    _is_pro        = sub_plan_id in ("pro",)
-    _is_enterprise = sub_plan_id in ("enterprise",)
-    _is_paid       = _is_pro or _is_enterprise
-
-    _settings_row = {
-        "user_id":  user_id,
-        "Plans":    sub_plan_id,
-
-        # ── Free + Pro + Enterprise ───────────────────────────────────────────
-        "enable_detection":    True,
-        "detect_medium":       True,
-        "detect_low":          True,
-        "show_notifications":  True,
-        "auto_mask_inputs":    True,
-        "auto_mask_textareas": True,
-        "overlay_input":       True,
-        "overlay_textarea":    True,
-        "show_risk_score":     True,
-        "show_recent_activity":True,
-        "masking_style":       "blur",
-
-        # ── Pro + Enterprise only ─────────────────────────────────────────────
-        "auto_mask_critical":   _is_paid,
-        "auto_mask_editor":     _is_paid,
-        "mask_console":         _is_paid,
-        "overlay_editor":       _is_paid,
-        "scan_large_docs":      _is_paid,
-        "detect_critical":      _is_paid,
-        "detect_high":          _is_paid,
-        "notify_critical":      _is_paid,
-        "notify_high":          _is_paid,
-        "realtime_updates":     _is_paid,
-        "animated_charts":      _is_paid,
-        "auto_refresh":         _is_paid,
-        "preserve_context":     _is_paid,
-        "site_exclusions_status": _is_paid,
-        "global_masking_status":  _is_paid,
-        "block_network_secrets":  _is_paid,
-        "block_form_submission":  _is_paid,
-        "site_exclusions":        None,
-
-        # ── Enterprise only ───────────────────────────────────────────────────
-        "aggressive_email_blocking": _is_enterprise,
-        "email_dlp_enabled":         _is_enterprise,
-        "enterprise_data_collection":_is_enterprise,
-        "waf_social_domain":         _is_enterprise,
-        "enterprise_email_domains":  None,
-    }
+    # ── Default settings row — feature flags come from the shared plan matrix ──
+    from app.core.plan_features import build_settings_row
+    _settings_row = build_settings_row(user_id, sub_plan_id)
     _set_err: Optional[str] = None
     _set_inserted = False
     try:
@@ -866,14 +820,10 @@ def google_signin(data: GoogleSignInRequest):
 
         # Default settings
         try:
-            _svc.table("user_settings").insert({
-                "user_id": user_id, "Plans": "free",
-                "enable_detection": True, "detect_medium": True, "detect_low": True,
-                "show_notifications": True, "auto_mask_inputs": True,
-                "auto_mask_textareas": True, "overlay_input": True,
-                "overlay_textarea": True, "show_risk_score": True,
-                "show_recent_activity": True, "masking_style": "blur",
-            }).execute()
+            from app.core.plan_features import build_settings_row
+            _svc.table("user_settings").insert(
+                build_settings_row(user_id, "free")
+            ).execute()
         except Exception:
             pass
 

@@ -371,7 +371,11 @@ def verify_payment(
             detail={"error": 1, "message": f"Subscription activation failed: {e}"},
         )
 
-    # ── Step 5: Mark transaction as paid ─────────────────────────────────────
+    # ── Step 5: Unlock plan features in user_settings ────────────────────────
+    from app.core.plan_features import apply_plan_settings
+    apply_plan_settings(user_id, stored_plan_id, supabase_service)
+
+    # ── Step 6: Mark transaction as paid ─────────────────────────────────────
     try:
         supabase_service.table("payment_transactions").update({
             "status":              "paid",
