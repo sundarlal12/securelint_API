@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends
 from supabase import create_client
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 from app.core.supabase_jwt import verify_supabase_jwt
-from app.core.plan_features import build_settings_row, _get_all_features, _STATIC_FIELDS
+from app.core.plan_features import build_settings_row, _get_all_features
 
 router = APIRouter()
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -11,17 +11,20 @@ supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 _SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 supabase_service = create_client(SUPABASE_URL, _SERVICE_KEY) if _SERVICE_KEY else supabase
 
+# Array-type columns — never set to False when masking, keep as None
+_ARRAY_COLUMNS = {"waf_social_domain", "email_dlp_domain", "enterprise_email_domains", "site_exclusions"}
+
 
 def _mask_all_features(settings: dict, supabase_client) -> dict:
     """
     Returns a copy of settings with all boolean feature flags set to False.
-    Used when subscription is inactive — user can see the structure but not use features.
-    Non-boolean fields (masking_style, site_exclusions, Plans, etc.) are preserved.
+    Array columns are preserved as-is (None / []).
+    Non-boolean fields (masking_style, Plans, etc.) are also preserved.
     """
     boolean_cols = _get_all_features(supabase_client)
     masked = dict(settings)
     for col in boolean_cols:
-        if col in masked:
+        if col in masked and col not in _ARRAY_COLUMNS:
             masked[col] = False
     return masked
 
@@ -34,7 +37,6 @@ def get_settings(user=Depends(verify_supabase_jwt)):
     res = supabase_service.table("user_settings").select("*").eq("user_id", user_id).execute()
 
     if not res.data:
-        # No row yet — create one from plan_settings (all-False defaults via plan_features)
         try:
             sub_res = supabase_service.table("user_subscriptions").select("plan_id").eq("user_id", user_id).limit(1).execute()
             plan_id = sub_res.data[0]["plan_id"] if sub_res.data else "free"
@@ -52,25 +54,31 @@ def get_settings(user=Depends(verify_supabase_jwt)):
 
     # ── Check subscription status ─────────────────────────────────────────────
     is_active = False
+    plan_id = settings.get("Plans", "free")
     try:
         sub_res = (
             supabase_service
             .table("user_subscriptions")
-            .select("status")
+            .select("plan_id, status")
             .eq("user_id", user_id)
             .limit(1)
             .execute()
         )
         if sub_res.data:
             is_active = sub_res.data[0].get("status") == "active"
+            plan_id   = sub_res.data[0].get("plan_id", plan_id)
     except Exception:
         pass
 
     # ── Gate: return real settings only if subscription is active ─────────────
     if not is_active:
-        return _mask_all_features(settings, supabase_service)
+        result = _mask_all_features(settings, supabase_service)
+    else:
+        result = dict(settings)
 
-    return settings
+    result["subscription_active"] = is_active
+    result["plan_id"]             = plan_id
+    return result
 
 
 @router.put("/settings")
