@@ -3,6 +3,7 @@ from supabase import create_client
 from typing import Optional
 import os
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
+from app.routes.settings import _mask_all_features
 
 router = APIRouter()
 
@@ -28,27 +29,28 @@ def get_user_me(authorization: Optional[str] = Header(None)):
 
     # Auth user details
     try:
-        auth_user = supabase_service.auth.admin.get_user_by_id(user_id)
-        email     = auth_user.user.email or ""
-        meta      = auth_user.user.user_metadata or {}
-        full_name = meta.get("full_name") or meta.get("name") or ""
+        auth_user  = supabase_service.auth.admin.get_user_by_id(user_id)
+        email      = auth_user.user.email or ""
+        meta       = auth_user.user.user_metadata or {}
+        full_name  = meta.get("full_name") or meta.get("name") or ""
         created_at = str(auth_user.user.created_at or "")
     except Exception:
         email, full_name, created_at = "", "", ""
 
-    # Subscription — read from user_subscriptions; fall back to user_settings.Plans
+    # Subscription
     plan_id     = "free"
     plan_status = "inactive"
+    is_active   = False
     try:
         sub_res = supabase_service.table("user_subscriptions").select("plan_id, status").eq("user_id", user_id).execute()
         if sub_res.data:
             sub         = sub_res.data[0]
             plan_id     = sub.get("plan_id") or "free"
             plan_status = sub.get("status")  or "inactive"
+            is_active   = plan_status == "active"
         else:
-            # No subscription row — check user_settings.Plans as fallback
             try:
-                st_res  = supabase_service.table("user_settings").select("Plans").eq("user_id", user_id).execute()
+                st_res = supabase_service.table("user_settings").select("Plans").eq("user_id", user_id).execute()
                 if st_res.data and st_res.data[0].get("Plans"):
                     plan_id = st_res.data[0]["Plans"]
             except Exception:
@@ -65,22 +67,26 @@ def get_user_me(authorization: Optional[str] = Header(None)):
     except Exception:
         plan_info = {"id": plan_id, "name": plan_id.capitalize(), "price_monthly": 0}
 
-    # User settings
+    # User settings — mask all boolean features when subscription is inactive
     try:
         settings_res = supabase_service.table("user_settings").select("*").eq("user_id", user_id).execute()
         settings     = settings_res.data[0] if settings_res.data else {}
     except Exception:
         settings = {}
 
+    if not is_active:
+        settings = _mask_all_features(settings, supabase_service)
+
     return {
-        "error":       0,
-        "user_id":     user_id,
-        "email":       email,
-        "full_name":   full_name,
-        "created_at":  created_at,
-        "plan":        plan_info,
-        "plan_status": plan_status,
-        "settings":    settings,
+        "error":               0,
+        "user_id":             user_id,
+        "email":               email,
+        "full_name":           full_name,
+        "created_at":          created_at,
+        "plan":                plan_info,
+        "plan_status":         plan_status,
+        "subscription_active": is_active,
+        "settings":            settings,
     }
 
 
