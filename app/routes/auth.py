@@ -255,6 +255,59 @@ def get_plan_pricing(plan_id: Optional[str] = None):
     return {"error": 0, "pricing": all_rows}
 
 
+# ── GET /api/plan-settings ────────────────────────────────────────────────────
+@router.get("/plan-settings")
+def get_plan_settings(plan: Optional[str] = None):
+    """
+    Returns features available for a plan from the plan_settings table.
+    ?plan=free        → features for free plan only
+    ?plan=pro         → features for pro plan only
+    ?plan=enterprise  → features for enterprise plan only
+    No param          → all plans grouped by plan_name
+    """
+    try:
+        q = supabase_service \
+            .table("plan_settings") \
+            .select("plan_name, feature, description")
+
+        if plan:
+            q = q.eq("plan_name", plan.lower().strip())
+
+        res = q.order("plan_name").execute()
+
+        if not res.data:
+            return {"error": 0, "plan_settings": {}}
+
+        # Group features by plan_name
+        grouped: dict = {}
+        for row in res.data:
+            pname = row["plan_name"]
+            if pname not in grouped:
+                grouped[pname] = []
+            grouped[pname].append({
+                "feature":     row["feature"],
+                "description": row.get("description", ""),
+            })
+
+        # If a specific plan was requested return flat list, else return all grouped
+        if plan:
+            plan_key = plan.lower().strip()
+            return {
+                "error":    0,
+                "plan":     plan_key,
+                "features": grouped.get(plan_key, []),
+                "count":    len(grouped.get(plan_key, [])),
+            }
+
+        return {
+            "error":         0,
+            "plan_settings": grouped,
+        }
+
+    except Exception as e:
+        return {"error": 1, "message": f"Failed to fetch plan settings: {str(e)}"}
+
+
 class AuthRequest(BaseModel):
     email: str
     password: str
@@ -409,9 +462,9 @@ def signup(data: SignupRequest):
             _sub_err = f"update exception: {_e2}"
             print(f"[signup] user_subscriptions update exception: {_e2}")
 
-    # ── Default settings row — feature flags come from the shared plan matrix ──
+    # ── Default settings row — all features False (inactive until payment) ──────
     from app.core.plan_features import build_settings_row
-    _settings_row = build_settings_row(user_id, sub_plan_id)
+    _settings_row = build_settings_row(user_id, sub_plan_id, _svc)
     _set_err: Optional[str] = None
     _set_inserted = False
     try:
@@ -818,11 +871,11 @@ def google_signin(data: GoogleSignInRequest):
         except Exception:
             pass
 
-        # Default settings
+        # Default settings — all features False until payment confirmed
         try:
             from app.core.plan_features import build_settings_row
             _svc.table("user_settings").insert(
-                build_settings_row(user_id, "free")
+                build_settings_row(user_id, "free", _svc)
             ).execute()
         except Exception:
             pass

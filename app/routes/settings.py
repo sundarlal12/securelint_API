@@ -1,172 +1,99 @@
+import os
 from fastapi import APIRouter, Depends
 from supabase import create_client
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 from app.core.supabase_jwt import verify_supabase_jwt
-
-from fastapi import APIRouter, Depends, Body
-from supabase import create_client
-from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
-from app.core.supabase_jwt import verify_supabase_jwt
+from app.core.plan_features import build_settings_row, _get_all_features, _STATIC_FIELDS
 
 router = APIRouter()
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+supabase_service = create_client(SUPABASE_URL, _SERVICE_KEY) if _SERVICE_KEY else supabase
+
+
+def _mask_all_features(settings: dict, supabase_client) -> dict:
+    """
+    Returns a copy of settings with all boolean feature flags set to False.
+    Used when subscription is inactive — user can see the structure but not use features.
+    Non-boolean fields (masking_style, site_exclusions, Plans, etc.) are preserved.
+    """
+    boolean_cols = _get_all_features(supabase_client)
+    masked = dict(settings)
+    for col in boolean_cols:
+        if col in masked:
+            masked[col] = False
+    return masked
 
 
 @router.get("/settings")
 def get_settings(user=Depends(verify_supabase_jwt)):
     user_id = user["sub"]
 
-    res = (
-        supabase
-        .table("user_settings")
-        .select("*")
-        .eq("user_id", user_id)
-        .execute()
-    )
+    # ── Fetch user_settings row ───────────────────────────────────────────────
+    res = supabase_service.table("user_settings").select("*").eq("user_id", user_id).execute()
 
     if not res.data:
-        # auto-create default settings (all features off for new users)
-        default = {
-            "user_id":                   user_id,
-            "Plans":                     None,
-            "enable_detection":          False,
-            "auto_mask_critical":        False,
-            "show_notifications":        False,
-            "mask_console":              False,
-            "scan_large_docs":           False,
-            "realtime_updates":          False,
-            "show_risk_score":           False,
-            "show_recent_activity":      False,
-            "animated_charts":           False,
-            "auto_refresh":              False,
-            "preserve_context":          False,
-            "auto_mask_textareas":       False,
-            "auto_mask_inputs":          False,
-            "overlay_input":             False,
-            "overlay_textarea":          False,
-            "overlay_editor":            False,
-            "block_network_secrets":     False,
-            "block_form_submission":     False,
-            "aggressive_email_blocking": False,
-            "detect_critical":           False,
-            "detect_high":               False,
-            "detect_medium":             False,
-            "detect_low":                False,
-            "notify_critical":           False,
-            "notify_high":               False,
-        }
-        supabase.table("user_settings").insert(default).execute()
-        return default
+        # No row yet — create one from plan_settings (all-False defaults via plan_features)
+        try:
+            sub_res = supabase_service.table("user_subscriptions").select("plan_id").eq("user_id", user_id).limit(1).execute()
+            plan_id = sub_res.data[0]["plan_id"] if sub_res.data else "free"
+        except Exception:
+            plan_id = "free"
 
-    return res.data[0]
+        default_row = build_settings_row(user_id, plan_id, supabase_service)
+        try:
+            supabase_service.table("user_settings").insert(default_row).execute()
+        except Exception:
+            pass
+        settings = default_row
+    else:
+        settings = res.data[0]
 
+    # ── Check subscription status ─────────────────────────────────────────────
+    is_active = False
+    try:
+        sub_res = (
+            supabase_service
+            .table("user_subscriptions")
+            .select("status")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if sub_res.data:
+            is_active = sub_res.data[0].get("status") == "active"
+    except Exception:
+        pass
 
+    # ── Gate: return real settings only if subscription is active ─────────────
+    if not is_active:
+        return _mask_all_features(settings, supabase_service)
 
-# @router.put("/settings")
-# def update_settings(
-#     updates: dict,
-#     user=Depends(verify_supabase_jwt)
-# ):
-#     user_id = user["sub"]
-
-#     # ensure row exists
-#     existing = (
-#         supabase
-#         .table("user_settings")
-#         .select("user_id")
-#         .eq("user_id", user_id)
-#         .execute()
-#     )
-
-#     if not existing.data:
-#         supabase.table("user_settings").insert({
-#             "user_id": user_id
-#         }).execute()
-
-#     supabase.table("user_settings") \
-#         .update(updates) \
-#         .eq("user_id", user_id) \
-#         .execute()
-
-#     return {"success": True}
+    return settings
 
 
 @router.put("/settings")
-def update_settings(
-    updates: dict,
-    user=Depends(verify_supabase_jwt)
-):
+def update_settings(updates: dict, user=Depends(verify_supabase_jwt)):
     user_id = user["sub"]
 
-    # ✅ EXACT columns from your table
-    allowed_fields = {
-        "Plans",
-        "show_risk_score",
-        "show_recent_activity",
-        "animated_charts",
-        "auto_refresh",
+    # Only allow columns that exist in user_settings
+    boolean_cols = set(_get_all_features(supabase_service))
+    non_boolean_allowed = {"masking_style", "site_exclusions", "waf_social_domain",
+                           "enterprise_email_domains", "email_dlp_domain",
+                           "email_dlp_action", "IT_mail", "Plans"}
+    allowed_fields = boolean_cols | non_boolean_allowed
 
-        "enable_detection",
-        "auto_mask_critical",
-        "show_notifications",
-        "mask_console",
-        "scan_large_docs",
-        "realtime_updates",
-
-        "masking_style",
-        "preserve_context",
-        "auto_mask_textareas",
-        "auto_mask_inputs",
-
-        "overlay_input",
-        "overlay_textarea",
-        "overlay_editor",
-
-        "block_network_secrets",
-        "block_form_submission",
-        "aggressive_email_blocking",
-
-        "detect_critical",
-        "detect_high",
-        "detect_medium",
-        "detect_low",
-
-        "notify_critical",
-        "notify_high",
-    }
-
-    # filter only valid columns
-    clean_updates = {
-        k: v for k, v in updates.items()
-        if k in allowed_fields
-    }
+    clean_updates = {k: v for k, v in updates.items() if k in allowed_fields}
 
     if not clean_updates:
-        return {
-            "success": False,
-            "message": "No valid settings fields provided"
-        }
+        return {"success": False, "message": "No valid settings fields provided"}
 
-    # ensure row exists
-    exists = (
-        supabase
-        .table("user_settings")
-        .select("user_id")
-        .eq("user_id", user_id)
-        .execute()
-    )
-
+    # Ensure row exists
+    exists = supabase.table("user_settings").select("user_id").eq("user_id", user_id).execute()
     if not exists.data:
-        supabase.table("user_settings").insert({
-            "user_id": user_id
-        }).execute()
+        supabase.table("user_settings").insert({"user_id": user_id}).execute()
 
-    supabase.table("user_settings") \
-        .update(clean_updates) \
-        .eq("user_id", user_id) \
-        .execute()
+    supabase.table("user_settings").update(clean_updates).eq("user_id", user_id).execute()
 
-    return {
-        "success": True,
-        "updated": clean_updates
-    }
+    return {"success": True, "updated": clean_updates}
