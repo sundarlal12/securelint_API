@@ -8,11 +8,15 @@ from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 
 router = APIRouter()
 
-_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
-_RZP_KEY_ID  = os.getenv("RAZORPAY_KEY_ID", "")
-_RZP_SECRET  = os.getenv("RAZORPAY_KEY_SECRET", "")
-_RESEND_KEY  = os.getenv("RESEND_API_KEY", "")
-_BASE_URL    = os.getenv("BASE_URL", "https://securelint.in")
+_SERVICE_KEY    = os.getenv("SUPABASE_SERVICE_KEY", "")
+_RZP_KEY_ID     = os.getenv("RAZORPAY_KEY_ID", "")
+_RZP_SECRET     = os.getenv("RAZORPAY_KEY_SECRET", "")
+_RESEND_KEY     = os.getenv("RESEND_API_KEY", "")
+_BASE_URL       = os.getenv("BASE_URL", "https://securelint.in")
+_PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
+_PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
+_PP_BASE        = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com")
+_GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "TEST")   # TEST | PRODUCTION
 
 supabase_service = (
     create_client(SUPABASE_URL, _SERVICE_KEY)
@@ -188,7 +192,7 @@ def create_order(
                 price_inr = float(plan.get("price_monthly") or 0) * months
                 plan_name = plan.get("name", body.plan_id)
             else:
-                price_inr = {"free": 0, "pro": 2999}.get(body.plan_id, 0) * months
+                price_inr = {"pro": 2999}.get(body.plan_id, 0) * months
         except Exception:
             price_inr = 0
 
@@ -408,5 +412,361 @@ def verify_payment(
         "plan_status":    "active",
         "ends_at":        ends,
         "payment_id":     body.razorpay_payment_id,
+        "message":        f"Payment successful! {plan_name} plan is now active.",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PayPal helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _pp_access_token() -> str:
+    """Exchange PayPal client_id + secret for a short-lived Bearer token."""
+    if not _PP_CLIENT_ID or not _PP_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": 1, "message": "PayPal credentials not configured (PAYPAL_CLIENT_ID / PAYPAL_SECRET)."},
+        )
+    try:
+        resp = httpx.post(
+            f"{_PP_BASE}/v1/oauth2/token",
+            auth=(_PP_CLIENT_ID, _PP_SECRET),
+            data={"grant_type": "client_credentials"},
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"PayPal auth failed: {e}"})
+
+
+def _pp_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+
+
+def _lookup_price(plan_id: str, billing_period: str) -> tuple[float, str]:
+    """Return (price_inr, plan_name) from plan_pricing or plans tables."""
+    plan_name = plan_id.capitalize()
+    try:
+        pp_res = (
+            supabase_service.table("plan_pricing")
+            .select("total_price")
+            .eq("plan_id", plan_id)
+            .eq("billing_period", billing_period)
+            .eq("is_active", True)
+            .execute()
+        )
+        if pp_res.data:
+            return float(pp_res.data[0]["total_price"]), plan_name
+    except Exception:
+        pass
+    try:
+        months   = _period_months(billing_period)
+        plan_res = supabase_service.table("plans").select("id, name, price_monthly").eq("id", plan_id).execute()
+        if plan_res.data:
+            plan      = plan_res.data[0]
+            plan_name = plan.get("name", plan_id)
+            return float(plan.get("price_monthly") or 0) * months, plan_name
+    except Exception:
+        pass
+    return 0.0, plan_name
+
+
+# ── POST /api/payment/paypal-create-order ────────────────────────────────────
+class PayPalCreateOrderRequest(BaseModel):
+    plan_id:        str
+    billing_period: Optional[str] = "monthly"
+
+
+@router.post("/payment/paypal-create-order")
+def paypal_create_order(
+    body: PayPalCreateOrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user_id, _user_email = _require_user(authorization)
+    billing_period       = (body.billing_period or "monthly").lower().strip()
+
+    price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
+    usd_amount           = round(price_inr / 83, 2)
+    if usd_amount <= 0:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
+
+    token = _pp_access_token()
+    try:
+        resp = httpx.post(
+            f"{_PP_BASE}/v2/checkout/orders",
+            headers=_pp_headers(token),
+            json={
+                "intent": "CAPTURE",
+                "purchase_units": [{
+                    "amount": {"currency_code": "USD", "value": f"{usd_amount:.2f}"},
+                    "description": f"SecureLint {plan_name} — {billing_period.capitalize()}",
+                }],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        order_data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Failed to create PayPal order: {e}"})
+
+    # Save pending transaction so verify can look up authoritative values
+    try:
+        supabase_service.table("payment_transactions").insert({
+            "user_id":         user_id,
+            "plan_id":         body.plan_id,
+            "billing_period":  billing_period,
+            "paypal_order_id": order_data["id"],
+            "amount_usd":      usd_amount,
+            "currency":        "USD",
+            "status":          "created",
+        }).execute()
+    except Exception:
+        pass
+
+    return {
+        "error":      0,
+        "order_id":   order_data["id"],
+        "amount_usd": usd_amount,
+        "plan_id":    body.plan_id,
+        "plan_name":  plan_name,
+    }
+
+
+# ── POST /api/payment/paypal-verify ──────────────────────────────────────────
+class PayPalVerifyRequest(BaseModel):
+    paypal_order_id: str
+    plan_id:         Optional[str] = None
+    billing_period:  Optional[str] = None
+    country:         Optional[str] = None
+
+
+@router.post("/payment/paypal-verify")
+def verify_paypal_payment(
+    body: PayPalVerifyRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user_id, user_email = _require_user(authorization)
+
+    # ── Step 1: Confirm order is COMPLETED with PayPal ────────────────────────
+    token = _pp_access_token()
+    try:
+        resp = httpx.get(
+            f"{_PP_BASE}/v2/checkout/orders/{body.paypal_order_id}",
+            headers=_pp_headers(token),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        order_data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"PayPal order lookup failed: {e}"})
+
+    if order_data.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": f"PayPal order not completed. Status: {order_data.get('status')}"},
+        )
+
+    # ── Step 2: Load authoritative values from our DB ─────────────────────────
+    stored_plan_id    = body.plan_id       or "pro"
+    stored_billing    = body.billing_period or "monthly"
+    stored_amount_usd = 0.0
+
+    try:
+        tx_res = (
+            supabase_service.table("payment_transactions")
+            .select("plan_id, billing_period, amount_usd, user_id")
+            .eq("paypal_order_id", body.paypal_order_id)
+            .eq("status", "created")
+            .execute()
+        )
+        if tx_res.data:
+            row               = tx_res.data[0]
+            stored_plan_id    = row["plan_id"]
+            stored_billing    = row["billing_period"]
+            stored_amount_usd = float(row.get("amount_usd") or 0)
+            if row["user_id"] != user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"error": 1, "message": "This order does not belong to your account."},
+                )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": 1, "message": "Order not found or already processed."},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Could not load order details: {e}"})
+
+    # ── Step 3: Verify captured amount matches what we expect ─────────────────
+    try:
+        captures    = order_data["purchase_units"][0]["payments"]["captures"]
+        paid_amount = float(captures[0]["amount"]["value"])
+        if stored_amount_usd > 0 and paid_amount < stored_amount_usd - 0.02:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": 1, "message": f"Amount mismatch: expected ${stored_amount_usd:.2f}, got ${paid_amount:.2f}."},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # If we can't parse, PayPal already confirmed COMPLETED — proceed
+
+    # ── Step 4: Activate subscription ────────────────────────────────────────
+    now  = datetime.now(timezone.utc).isoformat()
+    ends = _ends_at(stored_billing)
+
+    try:
+        supabase_service.table("user_subscriptions").upsert(
+            {
+                "user_id":         user_id,
+                "plan_id":         stored_plan_id,
+                "status":          "active",
+                "billing_period":  stored_billing,
+                "starts_at":       now,
+                "ends_at":         ends,
+                "paypal_order_id": body.paypal_order_id,
+                "updated_at":      now,
+            },
+            on_conflict="user_id",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Subscription activation failed: {e}"})
+
+    # ── Step 5: Apply plan feature flags ─────────────────────────────────────
+    from app.core.plan_features import apply_plan_settings
+    apply_plan_settings(user_id, stored_plan_id, supabase_service)
+
+    # ── Step 6: Mark transaction paid ────────────────────────────────────────
+    try:
+        supabase_service.table("payment_transactions").update(
+            {"status": "paid", "paid_at": now}
+        ).eq("paypal_order_id", body.paypal_order_id).execute()
+    except Exception:
+        pass
+
+    # ── Step 7: Fetch display name + send email ───────────────────────────────
+    plan_name = stored_plan_id.capitalize()
+    try:
+        pl = supabase_service.table("plans").select("name").eq("id", stored_plan_id).execute()
+        if pl.data:
+            plan_name = pl.data[0].get("name", plan_name)
+    except Exception:
+        pass
+
+    _send_payment_email(
+        user_email, plan_name, stored_billing,
+        int(stored_amount_usd * 83 * 100),   # approx INR paise for email template
+        body.paypal_order_id,
+    )
+
+    return {
+        "error":          0,
+        "success":        True,
+        "plan_id":        stored_plan_id,
+        "plan_name":      plan_name,
+        "billing_period": stored_billing,
+        "plan_status":    "active",
+        "ends_at":        ends,
+        "payment_id":     body.paypal_order_id,
+        "message":        f"Payment successful! {plan_name} plan is now active.",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Google Pay
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GooglePayVerifyRequest(BaseModel):
+    payment_token:  str
+    plan_id:        Optional[str] = None
+    billing_period: Optional[str] = None
+    country:        Optional[str] = None
+
+
+@router.post("/payment/googlepay-verify")
+def verify_googlepay_payment(
+    body: GooglePayVerifyRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user_id, user_email = _require_user(authorization)
+
+    stored_plan_id = (body.plan_id       or "pro").lower().strip()
+    stored_billing = (body.billing_period or "monthly").lower().strip()
+
+    # ── Token verification ────────────────────────────────────────────────────
+    # TEST mode  : The "example" gateway returns a dummy token — nothing to verify.
+    # PRODUCTION : Replace this block with your payment gateway's token processing.
+    #   e.g. Stripe:     stripe.PaymentMethod.create(type="card", card={"token": body.payment_token})
+    #   e.g. Braintree:  gateway.transaction.sale({"payment_method_nonce": body.payment_token, ...})
+    if _GPAY_ENV != "TEST":
+        raise HTTPException(
+            status_code=501,
+            detail={"error": 1, "message": "Google Pay production gateway not yet configured."},
+        )
+
+    price_inr, plan_name = _lookup_price(stored_plan_id, stored_billing)
+    now  = datetime.now(timezone.utc).isoformat()
+    ends = _ends_at(stored_billing)
+
+    # ── Record transaction ────────────────────────────────────────────────────
+    try:
+        supabase_service.table("payment_transactions").insert({
+            "user_id":        user_id,
+            "plan_id":        stored_plan_id,
+            "billing_period": stored_billing,
+            "amount_paise":   int(price_inr * 100),
+            "currency":       "USD",
+            "status":         "paid",
+            "paid_at":        now,
+            "gateway":        "googlepay",
+        }).execute()
+    except Exception:
+        pass
+
+    # ── Activate subscription ─────────────────────────────────────────────────
+    try:
+        supabase_service.table("user_subscriptions").upsert(
+            {
+                "user_id":        user_id,
+                "plan_id":        stored_plan_id,
+                "status":         "active",
+                "billing_period": stored_billing,
+                "starts_at":      now,
+                "ends_at":        ends,
+                "updated_at":     now,
+            },
+            on_conflict="user_id",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Subscription activation failed: {e}"})
+
+    # ── Apply plan feature flags ──────────────────────────────────────────────
+    from app.core.plan_features import apply_plan_settings
+    apply_plan_settings(user_id, stored_plan_id, supabase_service)
+
+    _send_payment_email(
+        user_email, plan_name, stored_billing,
+        int(price_inr * 100),
+        f"gpay-{user_id[:8]}",
+    )
+
+    return {
+        "error":          0,
+        "success":        True,
+        "plan_id":        stored_plan_id,
+        "plan_name":      plan_name,
+        "billing_period": stored_billing,
+        "plan_status":    "active",
+        "ends_at":        ends,
         "message":        f"Payment successful! {plan_name} plan is now active.",
     }
