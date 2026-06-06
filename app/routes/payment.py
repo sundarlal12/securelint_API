@@ -850,10 +850,10 @@ def payu_create_order(
     if price_inr <= 0:
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
 
-    # PayU India uses INR — pass the authoritative INR price directly
-    amount_str = f"{price_inr:.2f}"
+    # Convert INR → USD (1 USD ≈ 83 INR); PayU supports USD with currency param
+    usd_amount = round(price_inr / 83, 2)
+    amount_str = f"{usd_amount:.2f}"
 
-    # Unique transaction ID
     import uuid
     txnid = f"SL-{uuid.uuid4().hex[:16].upper()}"
     productinfo = f"SecureLint {plan_name} - {billing_period.capitalize()}"
@@ -868,8 +868,8 @@ def payu_create_order(
             "plan_id":        body.plan_id,
             "billing_period": billing_period,
             "payu_txnid":     txnid,
-            "amount_paise":   int(price_inr * 100),
-            "currency":       "INR",
+            "amount_usd":     usd_amount,
+            "currency":       "USD",
             "status":         "created",
             "gateway":        "payu",
         }).execute()
@@ -890,10 +890,11 @@ def payu_create_order(
             "surl":             _PAYU_SUCCESS,
             "furl":             _PAYU_FAIL,
             "hash":             hash_val,
+            "currency":         "USD",
             "service_provider": "payu_paisa",
         },
         "txnid":      txnid,
-        "amount_inr": price_inr,
+        "amount_usd": usd_amount,
         "plan_id":    body.plan_id,
         "plan_name":  plan_name,
     }
@@ -946,7 +947,7 @@ def verify_payu_payment(
     try:
         tx_res = (
             supabase_service.table("payment_transactions")
-            .select("plan_id, billing_period, amount_usd, user_id")
+            .select("plan_id, billing_period, amount_usd, currency, user_id")
             .eq("payu_txnid", body.txnid)
             .eq("status", "created")
             .execute()
