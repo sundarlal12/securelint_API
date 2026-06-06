@@ -15,8 +15,13 @@ _RESEND_KEY     = os.getenv("RESEND_API_KEY", "")
 _BASE_URL       = os.getenv("BASE_URL", "https://securelint.in")
 _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
-_PP_BASE        = os.getenv("PAYPAL_BASE_URL", "https://api-m.paypal.com")
+_PP_BASE        = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com")
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "TEST")   # TEST | PRODUCTION
+_PAYU_KEY       = os.getenv("PAYU_KEY", "")               # Merchant key
+_PAYU_SALT      = os.getenv("PAYU_SALT", "")              # Merchant salt
+_PAYU_BASE      = os.getenv("PAYU_BASE_URL", "https://test.payu.in")  # test.payu.in | secure.payu.in (prod)
+_PAYU_SUCCESS   = os.getenv("PAYU_SUCCESS_URL", "https://securelint.in/user/dashboard/subscription")
+_PAYU_FAIL      = os.getenv("PAYU_FAIL_URL",    "https://securelint.in/user/dashboard/billing")
 
 supabase_service = (
     create_client(SUPABASE_URL, _SERVICE_KEY)
@@ -776,5 +781,241 @@ def verify_googlepay_payment(
         "billing_period": stored_billing,
         "plan_status":    "active",
         "ends_at":        ends,
+        "message":        f"Payment successful! {plan_name} plan is now active.",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PayU Money  (hash-based redirect flow — works for India and international)
+# Docs: https://devguide.payu.in/
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _payu_hash(txnid: str, amount: str, productinfo: str,
+               firstname: str, email: str) -> str:
+    """
+    PayU forward hash:
+    SHA512( key|txnid|amount|productinfo|firstname|email|udf1..udf10||||||SALT )
+    All udf fields are empty for us.
+    """
+    import hashlib
+    raw = f"{_PAYU_KEY}|{txnid}|{amount}|{productinfo}|{firstname}|{email}|||||||||||{_PAYU_SALT}"
+    return hashlib.sha512(raw.encode("utf-8")).hexdigest()
+
+
+def _payu_verify_hash(txnid: str, amount: str, productinfo: str,
+                      firstname: str, email: str, status: str,
+                      posted_hash: str) -> bool:
+    """
+    PayU reverse hash:
+    SHA512( SALT|status||||||||||email|firstname|productinfo|amount|txnid|key )
+    """
+    import hashlib
+    raw = f"{_PAYU_SALT}|{status}|||||||||||{email}|{firstname}|{productinfo}|{amount}|{txnid}|{_PAYU_KEY}"
+    expected = hashlib.sha512(raw.encode("utf-8")).hexdigest()
+    return expected == posted_hash
+
+
+# ── POST /api/payment/payu-create-order ──────────────────────────────────────
+class PayUCreateOrderRequest(BaseModel):
+    plan_id:        str
+    billing_period: Optional[str] = "monthly"
+    full_name:      Optional[str] = ""
+    country:        Optional[str] = ""
+
+
+@router.post("/payment/payu-create-order")
+def payu_create_order(
+    body: PayUCreateOrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user_id, user_email = _require_user(authorization)
+    if not _PAYU_KEY or not _PAYU_SALT:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": 1, "message": "PayU credentials not configured (PAYU_KEY / PAYU_SALT)."},
+        )
+
+    billing_period = (body.billing_period or "monthly").lower().strip()
+    price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
+    usd_amount = round(price_inr / 83, 2)
+    if usd_amount <= 0:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
+
+    # Unique transaction ID
+    import uuid
+    txnid = f"SL-{uuid.uuid4().hex[:16].upper()}"
+    amount_str = f"{usd_amount:.2f}"
+    productinfo = f"SecureLint {plan_name} - {billing_period.capitalize()}"
+    firstname = (body.full_name or user_email.split("@")[0] or "Customer").strip()
+
+    hash_val = _payu_hash(txnid, amount_str, productinfo, firstname, user_email)
+
+    # Save pending transaction
+    try:
+        supabase_service.table("payment_transactions").insert({
+            "user_id":        user_id,
+            "plan_id":        body.plan_id,
+            "billing_period": billing_period,
+            "payu_txnid":     txnid,
+            "amount_usd":     usd_amount,
+            "currency":       "USD",
+            "status":         "created",
+            "gateway":        "payu",
+        }).execute()
+    except Exception:
+        pass
+
+    # Build the PayU hosted payment URL (GET redirect with params)
+    from urllib.parse import urlencode
+    params = {
+        "key":         _PAYU_KEY,
+        "txnid":       txnid,
+        "amount":      amount_str,
+        "productinfo": productinfo,
+        "firstname":   firstname,
+        "email":       user_email,
+        "surl":        _PAYU_SUCCESS,
+        "furl":        _PAYU_FAIL,
+        "hash":        hash_val,
+        "service_provider": "payu_paisa",
+    }
+    redirect_url = f"{_PAYU_BASE}/_payment?{urlencode(params)}"
+
+    return {
+        "error":        0,
+        "txnid":        txnid,
+        "amount_usd":   usd_amount,
+        "plan_id":      body.plan_id,
+        "plan_name":    plan_name,
+        "redirect_url": redirect_url,
+    }
+
+
+# ── POST /api/payment/payu-verify ────────────────────────────────────────────
+# Called after PayU redirects back to success URL, OR as a server-to-server
+# callback (PayU webhook).  Accepts both the redirect POST params and our
+# own verification payload.
+class PayUVerifyRequest(BaseModel):
+    txnid:          str
+    mihpayid:       Optional[str] = None    # PayU payment ID
+    status:         Optional[str] = None    # success | failure | pending
+    hash:           Optional[str] = None    # PayU response hash
+    amount:         Optional[str] = None
+    productinfo:    Optional[str] = None
+    firstname:      Optional[str] = None
+    email:          Optional[str] = None
+    plan_id:        Optional[str] = None
+    billing_period: Optional[str] = None
+
+
+@router.post("/payment/payu-verify")
+def verify_payu_payment(
+    body: PayUVerifyRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user_id, user_email = _require_user(authorization)
+
+    # ── Step 1: Verify hash ───────────────────────────────────────────────────
+    if body.hash and body.status and body.amount and body.productinfo and body.firstname and body.email:
+        if not _payu_verify_hash(
+            body.txnid, body.amount, body.productinfo,
+            body.firstname, body.email, body.status, body.hash,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": 1, "message": "PayU signature verification failed."},
+            )
+        if body.status.lower() != "success":
+            raise HTTPException(
+                status_code=400,
+                detail={"error": 1, "message": f"Payment not successful. Status: {body.status}"},
+            )
+
+    # ── Step 2: Load authoritative values from our DB ─────────────────────────
+    stored_plan_id = body.plan_id or "pro"
+    stored_billing = body.billing_period or "monthly"
+
+    try:
+        tx_res = (
+            supabase_service.table("payment_transactions")
+            .select("plan_id, billing_period, amount_usd, user_id")
+            .eq("payu_txnid", body.txnid)
+            .eq("status", "created")
+            .execute()
+        )
+        if tx_res.data:
+            row = tx_res.data[0]
+            stored_plan_id = row["plan_id"]
+            stored_billing = row["billing_period"]
+            if row["user_id"] != user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"error": 1, "message": "This transaction does not belong to your account."},
+                )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": 1, "message": "Transaction not found or already processed."},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Could not load transaction: {e}"})
+
+    # ── Step 3: Activate subscription ────────────────────────────────────────
+    now  = datetime.now(timezone.utc).isoformat()
+    ends = _ends_at(stored_billing)
+
+    try:
+        supabase_service.table("user_subscriptions").upsert(
+            {
+                "user_id":        user_id,
+                "plan_id":        stored_plan_id,
+                "status":         "active",
+                "billing_period": stored_billing,
+                "starts_at":      now,
+                "ends_at":        ends,
+                "updated_at":     now,
+            },
+            on_conflict="user_id",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Subscription activation failed: {e}"})
+
+    # ── Step 4: Apply plan features ───────────────────────────────────────────
+    from app.core.plan_features import apply_plan_settings
+    apply_plan_settings(user_id, stored_plan_id, supabase_service)
+
+    # ── Step 5: Mark transaction paid ─────────────────────────────────────────
+    try:
+        supabase_service.table("payment_transactions").update({
+            "status":       "paid",
+            "paid_at":      now,
+            "payu_mihpayid": body.mihpayid or "",
+        }).eq("payu_txnid", body.txnid).execute()
+    except Exception:
+        pass
+
+    # ── Step 6: Fetch plan name + send email ──────────────────────────────────
+    plan_name = stored_plan_id.capitalize()
+    try:
+        pl = supabase_service.table("plans").select("name").eq("id", stored_plan_id).execute()
+        if pl.data:
+            plan_name = pl.data[0].get("name", plan_name)
+    except Exception:
+        pass
+
+    price_inr, _ = _lookup_price(stored_plan_id, stored_billing)
+    _send_payment_email(user_email, plan_name, stored_billing, int(price_inr * 100), body.txnid)
+
+    return {
+        "error":          0,
+        "success":        True,
+        "plan_id":        stored_plan_id,
+        "plan_name":      plan_name,
+        "billing_period": stored_billing,
+        "plan_status":    "active",
+        "ends_at":        ends,
+        "payment_id":     body.txnid,
         "message":        f"Payment successful! {plan_name} plan is now active.",
     }
