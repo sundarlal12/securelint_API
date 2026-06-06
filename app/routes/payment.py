@@ -875,29 +875,26 @@ def payu_create_order(
     except Exception:
         pass
 
-    # Build the PayU hosted payment URL (GET redirect with params)
-    from urllib.parse import urlencode
-    params = {
-        "key":         _PAYU_KEY,
-        "txnid":       txnid,
-        "amount":      amount_str,
-        "productinfo": productinfo,
-        "firstname":   firstname,
-        "email":       user_email,
-        "surl":        _PAYU_SUCCESS,
-        "furl":        _PAYU_FAIL,
-        "hash":        hash_val,
-        "service_provider": "payu_paisa",
-    }
-    redirect_url = f"{_PAYU_BASE}/_payment?{urlencode(params)}"
-
+    # PayU requires a POST form submission — return params for frontend to POST
     return {
-        "error":        0,
-        "txnid":        txnid,
-        "amount_usd":   usd_amount,
-        "plan_id":      body.plan_id,
-        "plan_name":    plan_name,
-        "redirect_url": redirect_url,
+        "error":      0,
+        "action_url": f"{_PAYU_BASE}/_payment",
+        "params": {
+            "key":              _PAYU_KEY,
+            "txnid":            txnid,
+            "amount":           amount_str,
+            "productinfo":      productinfo,
+            "firstname":        firstname,
+            "email":            user_email,
+            "surl":             _PAYU_SUCCESS,
+            "furl":             _PAYU_FAIL,
+            "hash":             hash_val,
+            "service_provider": "payu_paisa",
+        },
+        "txnid":      txnid,
+        "amount_usd": usd_amount,
+        "plan_id":    body.plan_id,
+        "plan_name":  plan_name,
     }
 
 
