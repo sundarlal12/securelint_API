@@ -847,14 +847,15 @@ def payu_create_order(
 
     billing_period = (body.billing_period or "monthly").lower().strip()
     price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
-    usd_amount = round(price_inr / 83, 2)
-    if usd_amount <= 0:
+    if price_inr <= 0:
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
+
+    # PayU India uses INR — pass the authoritative INR price directly
+    amount_str = f"{price_inr:.2f}"
 
     # Unique transaction ID
     import uuid
     txnid = f"SL-{uuid.uuid4().hex[:16].upper()}"
-    amount_str = f"{usd_amount:.2f}"
     productinfo = f"SecureLint {plan_name} - {billing_period.capitalize()}"
     firstname = (body.full_name or user_email.split("@")[0] or "Customer").strip()
 
@@ -867,8 +868,8 @@ def payu_create_order(
             "plan_id":        body.plan_id,
             "billing_period": billing_period,
             "payu_txnid":     txnid,
-            "amount_usd":     usd_amount,
-            "currency":       "USD",
+            "amount_paise":   int(price_inr * 100),
+            "currency":       "INR",
             "status":         "created",
             "gateway":        "payu",
         }).execute()
@@ -892,7 +893,7 @@ def payu_create_order(
             "service_provider": "payu_paisa",
         },
         "txnid":      txnid,
-        "amount_usd": usd_amount,
+        "amount_inr": price_inr,
         "plan_id":    body.plan_id,
         "plan_name":  plan_name,
     }
