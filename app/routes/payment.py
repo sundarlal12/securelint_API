@@ -16,7 +16,7 @@ _BASE_URL       = os.getenv("BASE_URL", "https://securelint.in")
 _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
 _PP_BASE        = os.getenv("PAYPAL_BASE_URL", "")
-_GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "TEST")   # TEST | PRODUCTION
+_GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "")
 _PAYU_KEY       = os.getenv("PAYU_KEY", "")
 _PAYU_SALT      = os.getenv("PAYU_SALT", "")
 _PAYU_BASE      = os.getenv("PAYU_BASE_URL", "")
@@ -723,7 +723,12 @@ def verify_googlepay_payment(
     # PRODUCTION : Replace this block with your payment gateway's token processing.
     #   e.g. Stripe:     stripe.PaymentMethod.create(type="card", card={"token": body.payment_token})
     #   e.g. Braintree:  gateway.transaction.sale({"payment_method_nonce": body.payment_token, ...})
-    if _GPAY_ENV != "TEST":
+    if not _GPAY_ENV:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": 1, "message": "GPAY_ENVIRONMENT env var not set."},
+        )
+    if _GPAY_ENV.upper() != "TEST":
         raise HTTPException(
             status_code=501,
             detail={"error": 1, "message": "Google Pay production gateway not yet configured."},
