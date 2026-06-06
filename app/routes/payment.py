@@ -19,7 +19,7 @@ _PP_BASE        = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "TEST")   # TEST | PRODUCTION
 _PAYU_KEY       = os.getenv("PAYU_KEY", "")               # Merchant key
 _PAYU_SALT      = os.getenv("PAYU_SALT", "")              # Merchant salt
-_PAYU_BASE      = os.getenv("PAYU_BASE_URL", "https://test.payu.in")  # test.payu.in | secure.payu.in (prod)
+_PAYU_BASE      = os.getenv("PAYU_BASE_URL", "https://secure.payu.in")  # secure.payu.in (prod) | test.payu.in (test)
 _PAYU_SUCCESS   = os.getenv("PAYU_SUCCESS_URL", "https://securelint.in/user/dashboard/subscription")
 _PAYU_FAIL      = os.getenv("PAYU_FAIL_URL",    "https://securelint.in/user/dashboard/billing")
 
