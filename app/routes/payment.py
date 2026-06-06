@@ -503,12 +503,16 @@ def paypal_create_order(
                 "intent": "CAPTURE",
                 "purchase_units": [{
                     "amount": {"currency_code": "USD", "value": f"{usd_amount:.2f}"},
-                    "description": f"SecureLint {plan_name} — {billing_period.capitalize()}",
+                    "description": f"SecureLint {plan_name} - {billing_period.capitalize()}",
                 }],
             },
             timeout=15,
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": 1, "message": f"PayPal order error {resp.status_code}: {resp.text}"},
+            )
         order_data = resp.json()
     except HTTPException:
         raise
@@ -561,7 +565,11 @@ def verify_paypal_payment(
             headers=_pp_headers(token),
             timeout=15,
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": 1, "message": f"PayPal lookup error {resp.status_code}: {resp.text}"},
+            )
         order_data = resp.json()
     except HTTPException:
         raise
