@@ -15,7 +15,7 @@ _RESEND_KEY     = os.getenv("RESEND_API_KEY", "")
 _BASE_URL       = os.getenv("BASE_URL", "https://securelint.in")
 _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
-_PP_BASE        = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com")
+_PP_BASE        = os.getenv("PAYPAL_BASE_URL", "https://api-m.paypal.com")
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "TEST")   # TEST | PRODUCTION
 
 supabase_service = (
