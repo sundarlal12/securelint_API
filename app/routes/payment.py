@@ -15,13 +15,13 @@ _RESEND_KEY     = os.getenv("RESEND_API_KEY", "")
 _BASE_URL       = os.getenv("BASE_URL", "https://securelint.in")
 _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
-_PP_BASE        = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com")
+_PP_BASE        = os.getenv("PAYPAL_BASE_URL", "")
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "TEST")   # TEST | PRODUCTION
-_PAYU_KEY       = os.getenv("PAYU_KEY", "")               # Merchant key
-_PAYU_SALT      = os.getenv("PAYU_SALT", "")              # Merchant salt
-_PAYU_BASE      = os.getenv("PAYU_BASE_URL", "https://secure.payu.in")  # secure.payu.in (prod) | test.payu.in (test)
-_PAYU_SUCCESS   = os.getenv("PAYU_SUCCESS_URL", "https://securelint.in/user/dashboard/subscription")
-_PAYU_FAIL      = os.getenv("PAYU_FAIL_URL",    "https://securelint.in/user/dashboard/billing")
+_PAYU_KEY       = os.getenv("PAYU_KEY", "")
+_PAYU_SALT      = os.getenv("PAYU_SALT", "")
+_PAYU_BASE      = os.getenv("PAYU_BASE_URL", "")
+_PAYU_SUCCESS   = os.getenv("PAYU_SUCCESS_URL", "")
+_PAYU_FAIL      = os.getenv("PAYU_FAIL_URL",    "")
 
 supabase_service = (
     create_client(SUPABASE_URL, _SERVICE_KEY)
@@ -427,10 +427,12 @@ def verify_payment(
 
 def _pp_access_token() -> str:
     """Exchange PayPal client_id + secret for a short-lived Bearer token."""
-    if not _PP_CLIENT_ID or not _PP_SECRET:
+    needed = {"PAYPAL_CLIENT_ID": _PP_CLIENT_ID, "PAYPAL_SECRET": _PP_SECRET, "PAYPAL_BASE_URL": _PP_BASE}
+    missing = [k for k, v in needed.items() if not v]
+    if missing:
         raise HTTPException(
             status_code=500,
-            detail={"error": 1, "message": "PayPal credentials not configured (PAYPAL_CLIENT_ID / PAYPAL_SECRET)."},
+            detail={"error": 1, "message": f"PayPal env vars not set: {', '.join(missing)}"},
         )
     try:
         resp = httpx.post(
@@ -829,10 +831,13 @@ def payu_create_order(
     authorization: Optional[str] = Header(None),
 ):
     user_id, user_email = _require_user(authorization)
-    if not _PAYU_KEY or not _PAYU_SALT:
+    needed = {"PAYU_KEY": _PAYU_KEY, "PAYU_SALT": _PAYU_SALT, "PAYU_BASE_URL": _PAYU_BASE,
+              "PAYU_SUCCESS_URL": _PAYU_SUCCESS, "PAYU_FAIL_URL": _PAYU_FAIL}
+    missing = [k for k, v in needed.items() if not v]
+    if missing:
         raise HTTPException(
             status_code=500,
-            detail={"error": 1, "message": "PayU credentials not configured (PAYU_KEY / PAYU_SALT)."},
+            detail={"error": 1, "message": f"PayU env vars not set: {', '.join(missing)}"},
         )
 
     billing_period = (body.billing_period or "monthly").lower().strip()
