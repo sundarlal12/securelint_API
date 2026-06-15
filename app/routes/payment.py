@@ -812,15 +812,32 @@ def _payu_hash(txnid: str, amount: str, productinfo: str,
 
 def _payu_verify_hash(txnid: str, amount: str, productinfo: str,
                       firstname: str, email: str, status: str,
-                      posted_hash: str) -> bool:
+                      posted_hash: str,
+                      udf1: str = "", udf2: str = "", udf3: str = "",
+                      udf4: str = "", udf5: str = "") -> bool:
     """
-    PayU reverse hash:
-    SHA512( SALT|status||||||||||email|firstname|productinfo|amount|txnid|key )
+    PayU reverse hash (response):
+    SHA512(SALT|status||||||udf5|udf4|udf3|udf2|udf1|email|firstname|productinfo|amount|txnid|key)
     """
     import hashlib
-    raw = f"{_PAYU_SALT}|{status}|||||||||||{email}|{firstname}|{productinfo}|{amount}|{txnid}|{_PAYU_KEY}"
+    import json
+
+    raw = (
+        f"{_PAYU_SALT}|{status}||||||{udf5}|{udf4}|{udf3}|{udf2}|{udf1}|"
+        f"{email}|{firstname}|{productinfo}|{amount}|{txnid}|{_PAYU_KEY}"
+    )
     expected = hashlib.sha512(raw.encode("utf-8")).hexdigest()
-    return expected == posted_hash
+    if posted_hash == expected:
+        return True
+
+    # PayU may send v1/v2 hash JSON for newer integrations.
+    try:
+        parsed = json.loads(posted_hash)
+        if isinstance(parsed, dict):
+            return parsed.get("v1") == expected or parsed.get("v2") == expected
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return False
 
 
 # ── POST /api/payment/payu-create-order ──────────────────────────────────────
@@ -925,7 +942,7 @@ def payu_create_order(
 
     hash_val = _payu_hash(txnid, amount_str, productinfo, firstname, user_email)
 
-    # Save pending transaction
+    # Save pending transaction — required for payu-success callback activation.
     try:
         supabase_service.table("payment_transactions").insert({
             "user_id":        user_id,
@@ -937,8 +954,11 @@ def payu_create_order(
             "status":         "created",
             "gateway":        "payu",
         }).execute()
-    except Exception:
-        pass
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": 1, "message": f"Could not record PayU transaction: {e}"},
+        )
 
     # PayU requires a POST form submission — return params for frontend to POST
     return {
@@ -983,6 +1003,30 @@ def _activate_payu_subscription(
             .execute()
         )
         if not tx_res.data:
+            paid_res = (
+                supabase_service.table("payment_transactions")
+                .select("plan_id, billing_period, user_id")
+                .eq("payu_txnid", txnid)
+                .eq("status", "paid")
+                .execute()
+            )
+            if paid_res.data:
+                row = paid_res.data[0]
+                if not skip_user_check and expected_user_id and row["user_id"] != expected_user_id:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={"error": 1, "message": "This transaction does not belong to your account."},
+                    )
+                return {
+                    "error":          0,
+                    "success":        True,
+                    "plan_id":        row["plan_id"],
+                    "plan_name":      row["plan_id"].capitalize(),
+                    "billing_period": row["billing_period"],
+                    "plan_status":    "active",
+                    "payment_id":     txnid,
+                    "message":        "Subscription already active.",
+                }
             raise HTTPException(
                 status_code=400,
                 detail={"error": 1, "message": "Transaction not found or already processed."},
@@ -1077,22 +1121,34 @@ async def payu_success_callback(request: Request):
     firstname = str(form.get("firstname") or "")
     email = str(form.get("email") or "")
     mihpayid = str(form.get("mihpayid") or "")
+    udf1 = str(form.get("udf1") or "")
+    udf2 = str(form.get("udf2") or "")
+    udf3 = str(form.get("udf3") or "")
+    udf4 = str(form.get("udf4") or "")
+    udf5 = str(form.get("udf5") or "")
 
     if not txnid:
         return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
 
     if posted_hash and status and amount and productinfo and firstname and email:
-        if not _payu_verify_hash(txnid, amount, productinfo, firstname, email, status, posted_hash):
+        if not _payu_verify_hash(
+            txnid, amount, productinfo, firstname, email, status, posted_hash,
+            udf1, udf2, udf3, udf4, udf5,
+        ):
             return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=invalid", status_code=303)
         if status.lower() != "success":
             return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
 
     try:
-        _activate_payu_subscription(txnid, mihpayid=mihpayid, skip_user_check=True)
+        result = _activate_payu_subscription(txnid, mihpayid=mihpayid, skip_user_check=True)
     except HTTPException:
         return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
 
-    return RedirectResponse(f"{_BASE_URL}/user/dashboard/subscription?payu=success", status_code=303)
+    plan_id = result.get("plan_id", "pro")
+    return RedirectResponse(
+        f"{_BASE_URL}/user/dashboard/subscription?payu=success&txnid={txnid}&plan_id={plan_id}",
+        status_code=303,
+    )
 
 
 @router.post("/payment/payu-failure")
