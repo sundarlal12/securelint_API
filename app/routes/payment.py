@@ -868,6 +868,26 @@ def _payu_sanitize_phone(raw: str) -> str:
     return digits[:15]
 
 
+def _payu_validate_credentials() -> None:
+    """Fail fast on common PayU env misconfiguration."""
+    if _PAYU_KEY and _PAYU_SALT and _PAYU_KEY == _PAYU_SALT:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": 1, "message": "PAYU_SALT must differ from PAYU_KEY. Copy both from the PayU dashboard."},
+        )
+    base = (_PAYU_BASE or "").lower()
+    if base and "test.payu.in" in base and "secure.payu.in" not in base:
+        return
+    if base and "secure.payu.in" in base and _PAYU_KEY == "1Gg1ic":
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": 1,
+                "message": "PayU test key (1Gg1ic) cannot be used with secure.payu.in. Set live PAYU_KEY/PAYU_SALT on Vercel.",
+            },
+        )
+
+
 @router.post("/payment/payu-create-order")
 def payu_create_order(
     body: PayUCreateOrderRequest,
@@ -881,6 +901,7 @@ def payu_create_order(
             status_code=500,
             detail={"error": 1, "message": f"PayU env vars not set: {', '.join(missing)}"},
         )
+    _payu_validate_credentials()
 
     billing_period = (body.billing_period or "monthly").lower().strip()
     price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
@@ -932,6 +953,8 @@ def payu_create_order(
             "lastname":    lastname,
             "email":       user_email,
             "phone":       phone,
+            # Always use API callback routes — PayU POSTs form data here after payment.
+            # Vercel PAYU_SUCCESS_URL / PAYU_FAIL_URL env vars are not used for hosted checkout.
             "surl":        _payu_default_success_url(),
             "furl":        _payu_default_fail_url(),
             "hash":        hash_val,
