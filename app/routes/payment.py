@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from supabase import create_client
 from typing import Optional, Tuple
@@ -828,6 +829,40 @@ class PayUCreateOrderRequest(BaseModel):
     billing_period: Optional[str] = "monthly"
     full_name:      Optional[str] = ""
     country:        Optional[str] = ""
+    phone:          Optional[str] = ""
+
+
+def _payu_default_success_url() -> str:
+    api_base = os.getenv("API_PUBLIC_URL", "https://securelint-api.vercel.app")
+    return f"{api_base.rstrip('/')}/api/payment/payu-success"
+
+
+def _payu_default_fail_url() -> str:
+    api_base = os.getenv("API_PUBLIC_URL", "https://securelint-api.vercel.app")
+    return f"{api_base.rstrip('/')}/api/payment/payu-failure"
+
+
+def _payu_success_url() -> str:
+    return _PAYU_SUCCESS or _payu_default_success_url()
+
+
+def _payu_fail_url() -> str:
+    return _PAYU_FAIL or _payu_default_fail_url()
+
+
+def _payu_sanitize_name(name: str) -> str:
+    cleaned = " ".join(name.strip().split())
+    return cleaned[:60] or "Customer"
+
+
+def _payu_sanitize_productinfo(plan_name: str, billing_period: str) -> str:
+    label = f"SecureLint {plan_name} {billing_period.capitalize()}"
+    return label[:100]
+
+
+def _payu_sanitize_phone(raw: str) -> str:
+    digits = "".join(c for c in (raw or "") if c.isdigit())
+    return digits[:15]
 
 
 @router.post("/payment/payu-create-order")
@@ -836,8 +871,7 @@ def payu_create_order(
     authorization: Optional[str] = Header(None),
 ):
     user_id, user_email = _require_user(authorization)
-    needed = {"PAYU_KEY": _PAYU_KEY, "PAYU_SALT": _PAYU_SALT, "PAYU_BASE_URL": _PAYU_BASE,
-              "PAYU_SUCCESS_URL": _PAYU_SUCCESS, "PAYU_FAIL_URL": _PAYU_FAIL}
+    needed = {"PAYU_KEY": _PAYU_KEY, "PAYU_SALT": _PAYU_SALT, "PAYU_BASE_URL": _PAYU_BASE}
     missing = [k for k, v in needed.items() if not v]
     if missing:
         raise HTTPException(
@@ -850,14 +884,20 @@ def payu_create_order(
     if price_inr <= 0:
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
 
-    # Convert INR → USD (1 USD ≈ 83 INR); PayU supports USD with currency param
-    usd_amount = round(price_inr / 83, 2)
-    amount_str = f"{usd_amount:.2f}"
+    # PayU India expects INR unless multi-currency is explicitly enabled on the merchant account.
+    amount_str = f"{price_inr:.2f}"
+
+    phone = _payu_sanitize_phone(body.phone or "")
+    if len(phone) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": "A valid phone number is required for PayU."},
+        )
 
     import uuid
     txnid = f"SL-{uuid.uuid4().hex[:16].upper()}"
-    productinfo = f"SecureLint {plan_name} - {billing_period.capitalize()}"
-    firstname = (body.full_name or user_email.split("@")[0] or "Customer").strip()
+    productinfo = _payu_sanitize_productinfo(plan_name, billing_period)
+    firstname = _payu_sanitize_name(body.full_name or user_email.split("@")[0] or "Customer")
 
     hash_val = _payu_hash(txnid, amount_str, productinfo, firstname, user_email)
 
@@ -868,8 +908,8 @@ def payu_create_order(
             "plan_id":        body.plan_id,
             "billing_period": billing_period,
             "payu_txnid":     txnid,
-            "amount_usd":     usd_amount,
-            "currency":       "USD",
+            "amount_usd":     price_inr,
+            "currency":       "INR",
             "status":         "created",
             "gateway":        "payu",
         }).execute()
@@ -881,23 +921,157 @@ def payu_create_order(
         "error":      0,
         "action_url": f"{_PAYU_BASE}/_payment",
         "params": {
-            "key":              _PAYU_KEY,
-            "txnid":            txnid,
-            "amount":           amount_str,
-            "productinfo":      productinfo,
-            "firstname":        firstname,
-            "email":            user_email,
-            "surl":             _PAYU_SUCCESS,
-            "furl":             _PAYU_FAIL,
-            "hash":             hash_val,
-            "currency":         "USD",
-            "service_provider": "payu_paisa",
+            "key":         _PAYU_KEY,
+            "txnid":       txnid,
+            "amount":      amount_str,
+            "productinfo": productinfo,
+            "firstname":   firstname,
+            "email":       user_email,
+            "phone":       phone,
+            "surl":        _payu_default_success_url(),
+            "furl":        _payu_default_fail_url(),
+            "hash":        hash_val,
         },
         "txnid":      txnid,
-        "amount_usd": usd_amount,
+        "amount_inr": price_inr,
         "plan_id":    body.plan_id,
         "plan_name":  plan_name,
     }
+
+
+def _activate_payu_subscription(
+    txnid: str,
+    *,
+    mihpayid: str = "",
+    skip_user_check: bool = False,
+    expected_user_id: Optional[str] = None,
+) -> dict:
+    """Load a pending PayU txn and activate the subscription."""
+    try:
+        tx_res = (
+            supabase_service.table("payment_transactions")
+            .select("plan_id, billing_period, user_id")
+            .eq("payu_txnid", txnid)
+            .eq("status", "created")
+            .execute()
+        )
+        if not tx_res.data:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": 1, "message": "Transaction not found or already processed."},
+            )
+        row = tx_res.data[0]
+        if not skip_user_check and expected_user_id and row["user_id"] != expected_user_id:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": 1, "message": "This transaction does not belong to your account."},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Could not load transaction: {e}"})
+
+    user_id = row["user_id"]
+    stored_plan_id = row["plan_id"]
+    stored_billing = row["billing_period"]
+
+    user_email = ""
+    try:
+        user_res = supabase_service.auth.admin.get_user_by_id(user_id)
+        user_email = user_res.user.email or ""
+    except Exception:
+        pass
+
+    now  = datetime.now(timezone.utc).isoformat()
+    ends = _ends_at(stored_billing)
+
+    try:
+        supabase_service.table("user_subscriptions").upsert(
+            {
+                "user_id":        user_id,
+                "plan_id":        stored_plan_id,
+                "status":         "active",
+                "billing_period": stored_billing,
+                "starts_at":      now,
+                "ends_at":        ends,
+                "updated_at":     now,
+            },
+            on_conflict="user_id",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Subscription activation failed: {e}"})
+
+    from app.core.plan_features import apply_plan_settings
+    apply_plan_settings(user_id, stored_plan_id, supabase_service)
+
+    try:
+        supabase_service.table("payment_transactions").update({
+            "status":        "paid",
+            "paid_at":       now,
+            "payu_mihpayid": mihpayid or "",
+        }).eq("payu_txnid", txnid).execute()
+    except Exception:
+        pass
+
+    plan_name = stored_plan_id.capitalize()
+    try:
+        pl = supabase_service.table("plans").select("name").eq("id", stored_plan_id).execute()
+        if pl.data:
+            plan_name = pl.data[0].get("name", plan_name)
+    except Exception:
+        pass
+
+    if user_email:
+        price_inr, _ = _lookup_price(stored_plan_id, stored_billing)
+        _send_payment_email(user_email, plan_name, stored_billing, int(price_inr * 100), txnid)
+
+    return {
+        "error":          0,
+        "success":        True,
+        "plan_id":        stored_plan_id,
+        "plan_name":      plan_name,
+        "billing_period": stored_billing,
+        "plan_status":    "active",
+        "ends_at":        ends,
+        "payment_id":     txnid,
+        "message":        f"Payment successful! {plan_name} plan is now active.",
+    }
+
+
+@router.post("/payment/payu-success")
+async def payu_success_callback(request: Request):
+    """PayU POSTs here after a successful payment."""
+    form = dict(await request.form())
+    txnid = str(form.get("txnid") or "")
+    status = str(form.get("status") or "")
+    posted_hash = str(form.get("hash") or "")
+    amount = str(form.get("amount") or "")
+    productinfo = str(form.get("productinfo") or "")
+    firstname = str(form.get("firstname") or "")
+    email = str(form.get("email") or "")
+    mihpayid = str(form.get("mihpayid") or "")
+
+    if not txnid:
+        return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
+
+    if posted_hash and status and amount and productinfo and firstname and email:
+        if not _payu_verify_hash(txnid, amount, productinfo, firstname, email, status, posted_hash):
+            return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=invalid", status_code=303)
+        if status.lower() != "success":
+            return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
+
+    try:
+        _activate_payu_subscription(txnid, mihpayid=mihpayid, skip_user_check=True)
+    except HTTPException:
+        return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
+
+    return RedirectResponse(f"{_BASE_URL}/user/dashboard/subscription?payu=success", status_code=303)
+
+
+@router.post("/payment/payu-failure")
+async def payu_failure_callback(request: Request):
+    """PayU POSTs here after a failed/cancelled payment."""
+    return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
 
 
 # ── POST /api/payment/payu-verify ────────────────────────────────────────────
@@ -922,7 +1096,7 @@ def verify_payu_payment(
     body: PayUVerifyRequest,
     authorization: Optional[str] = Header(None),
 ):
-    user_id, user_email = _require_user(authorization)
+    user_id, _user_email = _require_user(authorization)
 
     # ── Step 1: Verify hash ───────────────────────────────────────────────────
     if body.hash and body.status and body.amount and body.productinfo and body.firstname and body.email:
@@ -940,91 +1114,8 @@ def verify_payu_payment(
                 detail={"error": 1, "message": f"Payment not successful. Status: {body.status}"},
             )
 
-    # ── Step 2: Load authoritative values from our DB ─────────────────────────
-    stored_plan_id = body.plan_id or "pro"
-    stored_billing = body.billing_period or "monthly"
-
-    try:
-        tx_res = (
-            supabase_service.table("payment_transactions")
-            .select("plan_id, billing_period, amount_usd, currency, user_id")
-            .eq("payu_txnid", body.txnid)
-            .eq("status", "created")
-            .execute()
-        )
-        if tx_res.data:
-            row = tx_res.data[0]
-            stored_plan_id = row["plan_id"]
-            stored_billing = row["billing_period"]
-            if row["user_id"] != user_id:
-                raise HTTPException(
-                    status_code=403,
-                    detail={"error": 1, "message": "This transaction does not belong to your account."},
-                )
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": 1, "message": "Transaction not found or already processed."},
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Could not load transaction: {e}"})
-
-    # ── Step 3: Activate subscription ────────────────────────────────────────
-    now  = datetime.now(timezone.utc).isoformat()
-    ends = _ends_at(stored_billing)
-
-    try:
-        supabase_service.table("user_subscriptions").upsert(
-            {
-                "user_id":        user_id,
-                "plan_id":        stored_plan_id,
-                "status":         "active",
-                "billing_period": stored_billing,
-                "starts_at":      now,
-                "ends_at":        ends,
-                "updated_at":     now,
-            },
-            on_conflict="user_id",
-        ).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Subscription activation failed: {e}"})
-
-    # ── Step 4: Apply plan features ───────────────────────────────────────────
-    from app.core.plan_features import apply_plan_settings
-    apply_plan_settings(user_id, stored_plan_id, supabase_service)
-
-    # ── Step 5: Mark transaction paid ─────────────────────────────────────────
-    try:
-        supabase_service.table("payment_transactions").update({
-            "status":       "paid",
-            "paid_at":      now,
-            "payu_mihpayid": body.mihpayid or "",
-        }).eq("payu_txnid", body.txnid).execute()
-    except Exception:
-        pass
-
-    # ── Step 6: Fetch plan name + send email ──────────────────────────────────
-    plan_name = stored_plan_id.capitalize()
-    try:
-        pl = supabase_service.table("plans").select("name").eq("id", stored_plan_id).execute()
-        if pl.data:
-            plan_name = pl.data[0].get("name", plan_name)
-    except Exception:
-        pass
-
-    price_inr, _ = _lookup_price(stored_plan_id, stored_billing)
-    _send_payment_email(user_email, plan_name, stored_billing, int(price_inr * 100), body.txnid)
-
-    return {
-        "error":          0,
-        "success":        True,
-        "plan_id":        stored_plan_id,
-        "plan_name":      plan_name,
-        "billing_period": stored_billing,
-        "plan_status":    "active",
-        "ends_at":        ends,
-        "payment_id":     body.txnid,
-        "message":        f"Payment successful! {plan_name} plan is now active.",
-    }
+    return _activate_payu_subscription(
+        body.txnid,
+        mihpayid=body.mihpayid or "",
+        expected_user_id=user_id,
+    )
