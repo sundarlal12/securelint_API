@@ -833,13 +833,11 @@ class PayUCreateOrderRequest(BaseModel):
 
 
 def _payu_default_success_url() -> str:
-    api_base = os.getenv("API_PUBLIC_URL", "https://securelint-api.vercel.app")
-    return f"{api_base.rstrip('/')}/api/payment/payu-success"
+    return f"{_BASE_URL.rstrip('/')}/api/payment/payu-success"
 
 
 def _payu_default_fail_url() -> str:
-    api_base = os.getenv("API_PUBLIC_URL", "https://securelint-api.vercel.app")
-    return f"{api_base.rstrip('/')}/api/payment/payu-failure"
+    return f"{_BASE_URL.rstrip('/')}/api/payment/payu-failure"
 
 
 def _payu_success_url() -> str:
@@ -850,9 +848,14 @@ def _payu_fail_url() -> str:
     return _PAYU_FAIL or _payu_default_fail_url()
 
 
-def _payu_sanitize_name(name: str) -> str:
+def _payu_sanitize_name(name: str) -> tuple[str, str]:
     cleaned = " ".join(name.strip().split())
-    return cleaned[:60] or "Customer"
+    if not cleaned:
+        return "Customer", ""
+    parts = cleaned.split(" ", 1)
+    firstname = parts[0][:60]
+    lastname = (parts[1] if len(parts) > 1 else "")[:60]
+    return firstname, lastname
 
 
 def _payu_sanitize_productinfo(plan_name: str, billing_period: str) -> str:
@@ -888,16 +891,16 @@ def payu_create_order(
     amount_str = f"{price_inr:.2f}"
 
     phone = _payu_sanitize_phone(body.phone or "")
-    if len(phone) < 8:
+    if len(phone) < 10:
         raise HTTPException(
             status_code=400,
-            detail={"error": 1, "message": "A valid phone number is required for PayU."},
+            detail={"error": 1, "message": "Please enter a valid 10-digit phone number for PayU."},
         )
 
     import uuid
-    txnid = f"SL-{uuid.uuid4().hex[:16].upper()}"
+    txnid = f"SL{uuid.uuid4().hex[:18].upper()}"
     productinfo = _payu_sanitize_productinfo(plan_name, billing_period)
-    firstname = _payu_sanitize_name(body.full_name or user_email.split("@")[0] or "Customer")
+    firstname, lastname = _payu_sanitize_name(body.full_name or user_email.split("@")[0] or "Customer")
 
     hash_val = _payu_hash(txnid, amount_str, productinfo, firstname, user_email)
 
@@ -926,6 +929,7 @@ def payu_create_order(
             "amount":      amount_str,
             "productinfo": productinfo,
             "firstname":   firstname,
+            "lastname":    lastname,
             "email":       user_email,
             "phone":       phone,
             "surl":        _payu_default_success_url(),
