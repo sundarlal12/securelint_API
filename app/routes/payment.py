@@ -19,7 +19,6 @@ _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
 _PP_BASE        = os.getenv("PAYPAL_BASE_URL", "")
 _PP_MODE        = os.getenv("PAYPAL_MODE", "live").lower().strip()
-_PP_CURRENCY    = os.getenv("PAYPAL_CURRENCY", "USD").upper().strip()
 _PP_USD_INR     = float(os.getenv("PAYPAL_USD_INR_RATE", "83"))
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "")
 _PAYU_KEY       = os.getenv("PAYU_KEY", "")
@@ -489,14 +488,11 @@ def _pp_headers(token: str) -> dict:
 
 def _paypal_order_amount(price_inr: float) -> tuple[str, str, int]:
     """
-    PayPal international checkout — charge in USD by default.
-    Set PAYPAL_CURRENCY=INR only if your PayPal account requires INR.
+    Indian PayPal merchant accounts (PPPL) only accept INR orders regardless of
+    buyer location. PayPal handles currency conversion for international buyers.
     """
-    if _PP_CURRENCY == "INR":
-        inr = round(price_inr, 2)
-        return "INR", f"{inr:.2f}", int(inr * 100)
-    usd = round(price_inr / _PP_USD_INR, 2)
-    return "USD", f"{usd:.2f}", int(usd * 100)
+    inr = round(price_inr, 2)
+    return "INR", f"{inr:.2f}", int(inr * 100)
 
 
 def _is_india_country(country: Optional[str]) -> bool:
