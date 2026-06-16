@@ -18,6 +18,7 @@ _API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "https://securelint-api.vercel.app
 _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
 _PP_BASE        = os.getenv("PAYPAL_BASE_URL", "")
+_PP_MODE        = os.getenv("PAYPAL_MODE", "live").lower().strip()
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "")
 _PAYU_KEY       = os.getenv("PAYU_KEY", "")
 _PAYU_SALT      = os.getenv("PAYU_SALT", "")
@@ -427,18 +428,59 @@ def verify_payment(
 # PayPal helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _pp_api_base() -> str:
+    """
+    Resolve PayPal REST API host.
+    Live:    https://api-m.paypal.com
+    Sandbox: https://api-m.sandbox.paypal.com
+    """
+    base = (_PP_BASE or "").strip().rstrip("/")
+    if base:
+        lowered = base.lower()
+        if "payu" in lowered or "razorpay" in lowered:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": 1,
+                    "message": (
+                        "PAYPAL_BASE_URL is misconfigured (it points to another payment gateway). "
+                        "On Vercel set PAYPAL_BASE_URL=https://api-m.paypal.com for live PayPal, "
+                        "or https://api-m.sandbox.paypal.com for sandbox."
+                    ),
+                },
+            )
+        if "paypal.com" not in lowered:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": 1,
+                    "message": (
+                        f"PAYPAL_BASE_URL must be a PayPal REST API host, not {base!r}. "
+                        "Use https://api-m.paypal.com (live) or "
+                        "https://api-m.sandbox.paypal.com (sandbox)."
+                    ),
+                },
+            )
+        return base
+
+    if _PP_MODE == "sandbox":
+        return "https://api-m.sandbox.paypal.com"
+    return "https://api-m.paypal.com"
+
+
 def _pp_access_token() -> str:
     """Exchange PayPal client_id + secret for a short-lived Bearer token."""
-    needed = {"PAYPAL_CLIENT_ID": _PP_CLIENT_ID, "PAYPAL_SECRET": _PP_SECRET, "PAYPAL_BASE_URL": _PP_BASE}
+    needed = {"PAYPAL_CLIENT_ID": _PP_CLIENT_ID, "PAYPAL_SECRET": _PP_SECRET}
     missing = [k for k, v in needed.items() if not v]
     if missing:
         raise HTTPException(
             status_code=500,
             detail={"error": 1, "message": f"PayPal env vars not set: {', '.join(missing)}"},
         )
+    api_base = _pp_api_base()
     try:
         resp = httpx.post(
-            f"{_PP_BASE}/v1/oauth2/token",
+            f"{api_base}/v1/oauth2/token",
             auth=(_PP_CLIENT_ID, _PP_SECRET),
             data={"grant_type": "client_credentials"},
             headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
@@ -504,9 +546,10 @@ def paypal_create_order(
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
 
     token = _pp_access_token()
+    api_base = _pp_api_base()
     try:
         resp = httpx.post(
-            f"{_PP_BASE}/v2/checkout/orders",
+            f"{api_base}/v2/checkout/orders",
             headers=_pp_headers(token),
             json={
                 "intent": "CAPTURE",
@@ -568,9 +611,10 @@ def verify_paypal_payment(
 
     # ── Step 1: Confirm order is COMPLETED with PayPal ────────────────────────
     token = _pp_access_token()
+    api_base = _pp_api_base()
     try:
         resp = httpx.get(
-            f"{_PP_BASE}/v2/checkout/orders/{body.paypal_order_id}",
+            f"{api_base}/v2/checkout/orders/{body.paypal_order_id}",
             headers=_pp_headers(token),
             timeout=15,
         )
