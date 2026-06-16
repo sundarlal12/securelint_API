@@ -488,11 +488,12 @@ def _pp_headers(token: str) -> dict:
 
 def _paypal_order_amount(price_inr: float) -> tuple[str, str, int]:
     """
-    Indian PayPal merchant accounts (PPPL) only accept INR orders regardless of
-    buyer location. PayPal handles currency conversion for international buyers.
+    PayPal REST v2 does NOT support INR. Orders must be in USD (or another
+    supported currency). The merchant account must be enabled for cross-border
+    USD receipts in PayPal Business settings.
     """
-    inr = round(price_inr, 2)
-    return "INR", f"{inr:.2f}", int(inr * 100)
+    usd = round(price_inr / _PP_USD_INR, 2)
+    return "USD", f"{usd:.2f}", int(usd * 100)
 
 
 def _is_india_country(country: Optional[str]) -> bool:
