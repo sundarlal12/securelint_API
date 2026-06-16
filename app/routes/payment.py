@@ -896,7 +896,25 @@ def _payu_sanitize_phone(raw: str) -> str:
     return digits[:15]
 
 
-def _payu_validate_credentials() -> None:
+def _resolve_user_email(user_id: str, fallback_email: Optional[str] = None) -> str:
+    """Prefer explicit email (PayU form / JWT); fall back to Supabase admin lookup."""
+    email = (fallback_email or "").strip()
+    if email:
+        return email
+    try:
+        user_res = supabase_service.auth.admin.get_user_by_id(user_id)
+        return user_res.user.email or ""
+    except Exception:
+        return ""
+
+
+def _payu_txn_amount_paise(row: dict, plan_id: str, billing_period: str) -> int:
+    stored = int(row.get("amount_paise") or 0)
+    if stored > 0:
+        return stored
+    price_inr, _ = _lookup_price(plan_id, billing_period)
+    return int(price_inr * 100)
+
     """Fail fast on common PayU env misconfiguration."""
     if _PAYU_KEY and _PAYU_SALT and _PAYU_KEY == _PAYU_SALT:
         raise HTTPException(
@@ -1003,12 +1021,13 @@ def _activate_payu_subscription(
     mihpayid: str = "",
     skip_user_check: bool = False,
     expected_user_id: Optional[str] = None,
+    fallback_email: Optional[str] = None,
 ) -> dict:
     """Load a pending PayU txn and activate the subscription."""
     try:
         tx_res = (
             supabase_service.table("payment_transactions")
-            .select("plan_id, billing_period, user_id")
+            .select("plan_id, billing_period, user_id, amount_paise")
             .eq("payu_txnid", txnid)
             .eq("status", "created")
             .execute()
@@ -1016,7 +1035,7 @@ def _activate_payu_subscription(
         if not tx_res.data:
             paid_res = (
                 supabase_service.table("payment_transactions")
-                .select("plan_id, billing_period, user_id")
+                .select("plan_id, billing_period, user_id, amount_paise")
                 .eq("payu_txnid", txnid)
                 .eq("status", "paid")
                 .execute()
@@ -1035,7 +1054,7 @@ def _activate_payu_subscription(
                     "plan_name":      row["plan_id"].capitalize(),
                     "billing_period": row["billing_period"],
                     "plan_status":    "active",
-                    "payment_id":     txnid,
+                    "payment_id":     mihpayid or txnid,
                     "message":        "Subscription already active.",
                 }
             raise HTTPException(
@@ -1056,13 +1075,7 @@ def _activate_payu_subscription(
     user_id = row["user_id"]
     stored_plan_id = row["plan_id"]
     stored_billing = row["billing_period"]
-
-    user_email = ""
-    try:
-        user_res = supabase_service.auth.admin.get_user_by_id(user_id)
-        user_email = user_res.user.email or ""
-    except Exception:
-        pass
+    user_email = _resolve_user_email(user_id, fallback_email)
 
     now  = datetime.now(timezone.utc).isoformat()
     ends = _ends_at(stored_billing)
@@ -1104,8 +1117,14 @@ def _activate_payu_subscription(
         pass
 
     if user_email:
-        price_inr, _ = _lookup_price(stored_plan_id, stored_billing)
-        _send_payment_email(user_email, plan_name, stored_billing, int(price_inr * 100), txnid)
+        amount_paise = _payu_txn_amount_paise(row, stored_plan_id, stored_billing)
+        _send_payment_email(
+            user_email,
+            plan_name,
+            stored_billing,
+            amount_paise,
+            mihpayid or txnid,
+        )
 
     return {
         "error":          0,
@@ -1115,7 +1134,7 @@ def _activate_payu_subscription(
         "billing_period": stored_billing,
         "plan_status":    "active",
         "ends_at":        ends,
-        "payment_id":     txnid,
+        "payment_id":     mihpayid or txnid,
         "message":        f"Payment successful! {plan_name} plan is now active.",
     }
 
@@ -1156,7 +1175,12 @@ async def payu_success_callback(request: Request):
             if status.lower() != "success":
                 return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
 
-        result = _activate_payu_subscription(txnid, mihpayid=mihpayid, skip_user_check=True)
+        result = _activate_payu_subscription(
+            txnid,
+            mihpayid=mihpayid,
+            skip_user_check=True,
+            fallback_email=email,
+        )
     except HTTPException:
         return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
     except Exception as e:
@@ -1201,7 +1225,7 @@ def verify_payu_payment(
     body: PayUVerifyRequest,
     authorization: Optional[str] = Header(None),
 ):
-    user_id, _user_email = _require_user(authorization)
+    user_id, user_email = _require_user(authorization)
 
     # ── Step 1: Verify hash ───────────────────────────────────────────────────
     if body.hash and body.status and body.amount and body.productinfo and body.firstname and body.email:
@@ -1223,4 +1247,5 @@ def verify_payu_payment(
         body.txnid,
         mihpayid=body.mihpayid or "",
         expected_user_id=user_id,
+        fallback_email=user_email or body.email or "",
     )
