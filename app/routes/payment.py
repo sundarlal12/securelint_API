@@ -949,7 +949,7 @@ def payu_create_order(
             "plan_id":        body.plan_id,
             "billing_period": billing_period,
             "payu_txnid":     txnid,
-            "amount_usd":     price_inr,
+            "amount_paise":   int(price_inr * 100),
             "currency":       "INR",
             "status":         "created",
             "gateway":        "payu",
