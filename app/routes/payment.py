@@ -19,7 +19,8 @@ _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
 _PP_BASE        = os.getenv("PAYPAL_BASE_URL", "")
 _PP_MODE        = os.getenv("PAYPAL_MODE", "live").lower().strip()
-_PP_CURRENCY    = os.getenv("PAYPAL_CURRENCY", "INR").upper().strip()
+_PP_CURRENCY    = os.getenv("PAYPAL_CURRENCY", "USD").upper().strip()
+_PP_USD_INR     = float(os.getenv("PAYPAL_USD_INR_RATE", "83"))
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "")
 _PAYU_KEY       = os.getenv("PAYU_KEY", "")
 _PAYU_SALT      = os.getenv("PAYU_SALT", "")
@@ -488,15 +489,18 @@ def _pp_headers(token: str) -> dict:
 
 def _paypal_order_amount(price_inr: float) -> tuple[str, str, int]:
     """
-    Return (currency_code, amount_string, amount_paise) for PayPal checkout.
-    Indian merchant accounts usually require INR — USD causes UNSUPPORTED_PAYEE_CURRENCY.
-    Set PAYPAL_CURRENCY=USD only if your PayPal account accepts USD.
+    PayPal international checkout — charge in USD by default.
+    Set PAYPAL_CURRENCY=INR only if your PayPal account requires INR.
     """
-    if _PP_CURRENCY == "USD":
-        usd = round(price_inr / 83, 2)
-        return "USD", f"{usd:.2f}", int(usd * 100)
-    inr = round(price_inr, 2)
-    return "INR", f"{inr:.2f}", int(inr * 100)
+    if _PP_CURRENCY == "INR":
+        inr = round(price_inr, 2)
+        return "INR", f"{inr:.2f}", int(inr * 100)
+    usd = round(price_inr / _PP_USD_INR, 2)
+    return "USD", f"{usd:.2f}", int(usd * 100)
+
+
+def _is_india_country(country: Optional[str]) -> bool:
+    return (country or "").strip().lower() in {"india", "in"}
 
 
 def _lookup_price(plan_id: str, billing_period: str) -> tuple[float, str]:
@@ -531,6 +535,7 @@ def _lookup_price(plan_id: str, billing_period: str) -> tuple[float, str]:
 class PayPalCreateOrderRequest(BaseModel):
     plan_id:        str
     billing_period: Optional[str] = "monthly"
+    country:        Optional[str] = None
 
 
 @router.post("/payment/paypal-create-order")
@@ -539,6 +544,11 @@ def paypal_create_order(
     authorization: Optional[str] = Header(None),
 ):
     user_id, _user_email = _require_user(authorization)
+    if _is_india_country(body.country):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": "PayPal is for international payments only. Use Razorpay for India."},
+        )
     billing_period       = (body.billing_period or "monthly").lower().strip()
 
     price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
@@ -613,6 +623,12 @@ def verify_paypal_payment(
     authorization: Optional[str] = Header(None),
 ):
     user_id, user_email = _require_user(authorization)
+
+    if _is_india_country(body.country):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": "PayPal is for international payments only. Use Razorpay for India."},
+        )
 
     # ── Step 1: Confirm order is COMPLETED with PayPal ────────────────────────
     token = _pp_access_token()
@@ -744,7 +760,7 @@ def verify_paypal_payment(
 
     _send_payment_email(
         user_email, plan_name, stored_billing,
-        stored_amount_paise if stored_amount_paise > 0 else int(_lookup_price(stored_plan_id, stored_billing)[0] * 100),
+        int(_lookup_price(stored_plan_id, stored_billing)[0] * 100),
         body.paypal_order_id,
     )
 
