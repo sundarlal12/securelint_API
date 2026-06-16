@@ -428,6 +428,12 @@ def verify_payment(
 # PayPal helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _pp_default_api_base() -> str:
+    if _PP_MODE == "sandbox":
+        return "https://api-m.sandbox.paypal.com"
+    return "https://api-m.paypal.com"
+
+
 def _pp_api_base() -> str:
     """
     Resolve PayPal REST API host.
@@ -437,35 +443,16 @@ def _pp_api_base() -> str:
     base = (_PP_BASE or "").strip().rstrip("/")
     if base:
         lowered = base.lower()
-        if "payu" in lowered or "razorpay" in lowered:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": 1,
-                    "message": (
-                        "PAYPAL_BASE_URL is misconfigured (it points to another payment gateway). "
-                        "On Vercel set PAYPAL_BASE_URL=https://api-m.paypal.com for live PayPal, "
-                        "or https://api-m.sandbox.paypal.com for sandbox."
-                    ),
-                },
+        if "payu" in lowered or "razorpay" in lowered or "paypal.com" not in lowered:
+            fallback = _pp_default_api_base()
+            print(
+                f"[paypal] ignoring invalid PAYPAL_BASE_URL={base!r}; "
+                f"using {fallback}. Fix Vercel env PAYPAL_BASE_URL."
             )
-        if "paypal.com" not in lowered:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": 1,
-                    "message": (
-                        f"PAYPAL_BASE_URL must be a PayPal REST API host, not {base!r}. "
-                        "Use https://api-m.paypal.com (live) or "
-                        "https://api-m.sandbox.paypal.com (sandbox)."
-                    ),
-                },
-            )
+            return fallback
         return base
 
-    if _PP_MODE == "sandbox":
-        return "https://api-m.sandbox.paypal.com"
-    return "https://api-m.paypal.com"
+    return _pp_default_api_base()
 
 
 def _pp_access_token() -> str:
