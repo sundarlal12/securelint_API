@@ -14,6 +14,7 @@ _RZP_KEY_ID     = os.getenv("RAZORPAY_KEY_ID", "")
 _RZP_SECRET     = os.getenv("RAZORPAY_KEY_SECRET", "")
 _RESEND_KEY     = os.getenv("RESEND_API_KEY", "")
 _BASE_URL       = os.getenv("BASE_URL", "https://securelint.in")
+_API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "https://securelint-api.vercel.app")
 _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
 _PP_BASE        = os.getenv("PAYPAL_BASE_URL", "")
@@ -850,11 +851,21 @@ class PayUCreateOrderRequest(BaseModel):
 
 
 def _payu_default_success_url() -> str:
-    return f"{_BASE_URL.rstrip('/')}/api/payment/payu-success"
+    # PayU browser POST must hit the API directly — Vercel Python can fail on
+    # proxied form bodies from Netlify. Netlify route remains as a fallback.
+    return f"{_API_PUBLIC_URL.rstrip('/')}/api/payment/payu-success"
 
 
 def _payu_default_fail_url() -> str:
-    return f"{_BASE_URL.rstrip('/')}/api/payment/payu-failure"
+    return f"{_API_PUBLIC_URL.rstrip('/')}/api/payment/payu-failure"
+
+
+def _parse_urlencoded_form(body: bytes) -> dict[str, str]:
+    """Parse PayU application/x-www-form-urlencoded POST body."""
+    from urllib.parse import parse_qs
+
+    parsed = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    return {k: (v[0] if v else "") for k, v in parsed.items()}
 
 
 def _payu_success_url() -> str:
@@ -1112,7 +1123,12 @@ def _activate_payu_subscription(
 @router.post("/payment/payu-success")
 async def payu_success_callback(request: Request):
     """PayU POSTs here after a successful payment."""
-    form = dict(await request.form())
+    try:
+        form = _parse_urlencoded_form(await request.body())
+    except Exception as e:
+        print(f"[payu-success] form parse error: {e}")
+        return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
+
     txnid = str(form.get("txnid") or "")
     status = str(form.get("status") or "")
     posted_hash = str(form.get("hash") or "")
@@ -1130,19 +1146,25 @@ async def payu_success_callback(request: Request):
     if not txnid:
         return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
 
-    if posted_hash and status and amount and productinfo and firstname and email:
-        if not _payu_verify_hash(
-            txnid, amount, productinfo, firstname, email, status, posted_hash,
-            udf1, udf2, udf3, udf4, udf5,
-        ):
-            return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=invalid", status_code=303)
-        if status.lower() != "success":
-            return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
-
     try:
+        if posted_hash and status and amount and productinfo and firstname and email:
+            if not _payu_verify_hash(
+                txnid, amount, productinfo, firstname, email, status, posted_hash,
+                udf1, udf2, udf3, udf4, udf5,
+            ):
+                return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=invalid", status_code=303)
+            if status.lower() != "success":
+                return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
+
         result = _activate_payu_subscription(txnid, mihpayid=mihpayid, skip_user_check=True)
     except HTTPException:
         return RedirectResponse(f"{_BASE_URL}/user/dashboard/billing?payu=failed", status_code=303)
+    except Exception as e:
+        print(f"[payu-success] activation error for txnid={txnid}: {e}")
+        return RedirectResponse(
+            f"{_BASE_URL}/user/dashboard/subscription?payu=success&txnid={txnid}",
+            status_code=303,
+        )
 
     plan_id = result.get("plan_id", "pro")
     return RedirectResponse(
