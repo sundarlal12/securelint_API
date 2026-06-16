@@ -657,7 +657,7 @@ def verify_paypal_payment(
     stored_plan_id    = body.plan_id       or "pro"
     stored_billing    = body.billing_period or "monthly"
     stored_amount_paise = 0
-    stored_currency   = _PP_CURRENCY
+    stored_currency   = "USD"
 
     try:
         tx_res = (
@@ -672,7 +672,7 @@ def verify_paypal_payment(
             stored_plan_id      = row["plan_id"]
             stored_billing      = row["billing_period"]
             stored_amount_paise = int(row.get("amount_paise") or 0)
-            stored_currency     = (row.get("currency") or _PP_CURRENCY).upper()
+            stored_currency     = (row.get("currency") or "USD").upper()
             if stored_amount_paise <= 0 and row.get("amount_usd"):
                 stored_amount_paise = int(float(row["amount_usd"]) * 100)
                 stored_currency = "USD"
@@ -990,6 +990,8 @@ def _payu_txn_amount_paise(row: dict, plan_id: str, billing_period: str) -> int:
     price_inr, _ = _lookup_price(plan_id, billing_period)
     return int(price_inr * 100)
 
+
+def _payu_validate_credentials() -> None:
     """Fail fast on common PayU env misconfiguration."""
     if _PAYU_KEY and _PAYU_SALT and _PAYU_KEY == _PAYU_SALT:
         raise HTTPException(
