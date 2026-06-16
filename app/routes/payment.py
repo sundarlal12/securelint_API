@@ -19,6 +19,7 @@ _PP_CLIENT_ID   = os.getenv("PAYPAL_CLIENT_ID", "")
 _PP_SECRET      = os.getenv("PAYPAL_SECRET", "")
 _PP_BASE        = os.getenv("PAYPAL_BASE_URL", "")
 _PP_MODE        = os.getenv("PAYPAL_MODE", "live").lower().strip()
+_PP_CURRENCY    = os.getenv("PAYPAL_CURRENCY", "INR").upper().strip()
 _GPAY_ENV       = os.getenv("GPAY_ENVIRONMENT", "")
 _PAYU_KEY       = os.getenv("PAYU_KEY", "")
 _PAYU_SALT      = os.getenv("PAYU_SALT", "")
@@ -485,6 +486,19 @@ def _pp_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
 
 
+def _paypal_order_amount(price_inr: float) -> tuple[str, str, int]:
+    """
+    Return (currency_code, amount_string, amount_paise) for PayPal checkout.
+    Indian merchant accounts usually require INR — USD causes UNSUPPORTED_PAYEE_CURRENCY.
+    Set PAYPAL_CURRENCY=USD only if your PayPal account accepts USD.
+    """
+    if _PP_CURRENCY == "USD":
+        usd = round(price_inr / 83, 2)
+        return "USD", f"{usd:.2f}", int(usd * 100)
+    inr = round(price_inr, 2)
+    return "INR", f"{inr:.2f}", int(inr * 100)
+
+
 def _lookup_price(plan_id: str, billing_period: str) -> tuple[float, str]:
     """Return (price_inr, plan_name) from plan_pricing or plans tables."""
     plan_name = plan_id.capitalize()
@@ -528,8 +542,8 @@ def paypal_create_order(
     billing_period       = (body.billing_period or "monthly").lower().strip()
 
     price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
-    usd_amount           = round(price_inr / 83, 2)
-    if usd_amount <= 0:
+    currency_code, amount_str, amount_paise = _paypal_order_amount(price_inr)
+    if float(amount_str) <= 0:
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
 
     token = _pp_access_token()
@@ -541,7 +555,7 @@ def paypal_create_order(
             json={
                 "intent": "CAPTURE",
                 "purchase_units": [{
-                    "amount": {"currency_code": "USD", "value": f"{usd_amount:.2f}"},
+                    "amount": {"currency_code": currency_code, "value": amount_str},
                     "description": f"SecureLint {plan_name} - {billing_period.capitalize()}",
                 }],
             },
@@ -565,9 +579,11 @@ def paypal_create_order(
             "plan_id":         body.plan_id,
             "billing_period":  billing_period,
             "paypal_order_id": order_data["id"],
-            "amount_usd":      usd_amount,
-            "currency":        "USD",
+            "amount_paise":    amount_paise,
+            "amount_usd":      float(amount_str) if currency_code == "USD" else None,
+            "currency":        currency_code,
             "status":          "created",
+            "gateway":         "paypal",
         }).execute()
     except Exception:
         pass
@@ -575,7 +591,9 @@ def paypal_create_order(
     return {
         "error":      0,
         "order_id":   order_data["id"],
-        "amount_usd": usd_amount,
+        "amount":     amount_str,
+        "currency":   currency_code,
+        "amount_usd": float(amount_str) if currency_code == "USD" else None,
         "plan_id":    body.plan_id,
         "plan_name":  plan_name,
     }
@@ -625,21 +643,26 @@ def verify_paypal_payment(
     # ── Step 2: Load authoritative values from our DB ─────────────────────────
     stored_plan_id    = body.plan_id       or "pro"
     stored_billing    = body.billing_period or "monthly"
-    stored_amount_usd = 0.0
+    stored_amount_paise = 0
+    stored_currency   = _PP_CURRENCY
 
     try:
         tx_res = (
             supabase_service.table("payment_transactions")
-            .select("plan_id, billing_period, amount_usd, user_id")
+            .select("plan_id, billing_period, amount_paise, amount_usd, currency, user_id")
             .eq("paypal_order_id", body.paypal_order_id)
             .eq("status", "created")
             .execute()
         )
         if tx_res.data:
-            row               = tx_res.data[0]
-            stored_plan_id    = row["plan_id"]
-            stored_billing    = row["billing_period"]
-            stored_amount_usd = float(row.get("amount_usd") or 0)
+            row                 = tx_res.data[0]
+            stored_plan_id      = row["plan_id"]
+            stored_billing      = row["billing_period"]
+            stored_amount_paise = int(row.get("amount_paise") or 0)
+            stored_currency     = (row.get("currency") or _PP_CURRENCY).upper()
+            if stored_amount_paise <= 0 and row.get("amount_usd"):
+                stored_amount_paise = int(float(row["amount_usd"]) * 100)
+                stored_currency = "USD"
             if row["user_id"] != user_id:
                 raise HTTPException(
                     status_code=403,
@@ -657,13 +680,21 @@ def verify_paypal_payment(
 
     # ── Step 3: Verify captured amount matches what we expect ─────────────────
     try:
-        captures    = order_data["purchase_units"][0]["payments"]["captures"]
-        paid_amount = float(captures[0]["amount"]["value"])
-        if stored_amount_usd > 0 and paid_amount < stored_amount_usd - 0.02:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": 1, "message": f"Amount mismatch: expected ${stored_amount_usd:.2f}, got ${paid_amount:.2f}."},
-            )
+        captures      = order_data["purchase_units"][0]["payments"]["captures"]
+        paid_amount   = float(captures[0]["amount"]["value"])
+        paid_currency = (captures[0]["amount"].get("currency_code") or stored_currency).upper()
+        expected      = stored_amount_paise / 100
+        if stored_amount_paise > 0:
+            if paid_currency == "INR" and paid_amount < expected - 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": 1, "message": f"Amount mismatch: expected ₹{expected:.2f}, got ₹{paid_amount:.2f}."},
+                )
+            if paid_currency == "USD" and paid_amount < expected - 0.02:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": 1, "message": f"Amount mismatch: expected ${expected:.2f}, got ${paid_amount:.2f}."},
+                )
     except HTTPException:
         raise
     except Exception:
@@ -713,7 +744,7 @@ def verify_paypal_payment(
 
     _send_payment_email(
         user_email, plan_name, stored_billing,
-        int(stored_amount_usd * 83 * 100),   # approx INR paise for email template
+        stored_amount_paise if stored_amount_paise > 0 else int(_lookup_price(stored_plan_id, stored_billing)[0] * 100),
         body.paypal_order_id,
     )
 
