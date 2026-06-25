@@ -89,10 +89,7 @@ def _build_base_row(
         "user_email":        user_email,
         "browser_id":        data.browserId,
         "extension_version": data.extensionVersion,
-        # Top-level request type (e.g. "blacklist_extensions_visit",
-        # "extension_install", "phishing", "email_dlp", …).
-        # Falls back to secret_type when data.type is absent.
-        "incident_type":     data.type or secret_type,
+        "type":              data.type or secret_type,
         "secret_type":       secret_type,
         "severity":          severity,
         "masked_preview":    masked_preview,
