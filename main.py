@@ -33,6 +33,7 @@ from app.routes.admin import router as admin_router
 from app.routes.payment import router as payment_router
 from app.routes.user import router as user_router
 from app.routes.contact import router as contact_router
+from app.routes.coupons import router as coupons_router
 app = FastAPI(
     title="SecureLint API",
     docs_url=None,        # disables /docs
@@ -76,3 +77,4 @@ app.include_router(admin_router, prefix="/api")
 app.include_router(payment_router, prefix="/api")
 app.include_router(user_router,    prefix="/api")
 app.include_router(contact_router, prefix="/api")
+app.include_router(coupons_router, prefix="/api")

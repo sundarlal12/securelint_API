@@ -6,6 +6,11 @@ from typing import Optional, Tuple
 from datetime import datetime, timedelta, timezone
 import os, hmac, hashlib, razorpay, httpx
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
+from app.routes.coupons import (
+    _validate_coupon_row,
+    _compute_discount,
+    reward_referrer_after_payment,
+)
 
 router = APIRouter()
 
@@ -88,6 +93,72 @@ def _verify_rzp_amount(payment_id: str, expected_paise: int) -> bool:
         return True  # Fail-open: signature already verified
 
 
+def _apply_coupon(coupon_code: Optional[str], user_id: str,
+                  plan_id: str, billing_period: str,
+                  original_paise: int) -> tuple[int, int, Optional[dict]]:
+    """
+    Validate and apply a coupon code server-side.
+    Returns (discount_paise, final_paise, coupon_row_or_None).
+    Raises HTTPException(400) if the code is invalid.
+    """
+    if not coupon_code:
+        return 0, original_paise, None
+
+    code = coupon_code.strip().upper()
+    try:
+        res = supabase_service.table("coupons").select("*").ilike("code", code).limit(1).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Coupon lookup failed: {e}"})
+
+    if not res.data:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid coupon code."})
+
+    coupon = res.data[0]
+    err = _validate_coupon_row(coupon, user_id, plan_id, billing_period, original_paise)
+    if err:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": err})
+
+    discount_paise = _compute_discount(coupon, original_paise)
+    final_paise    = original_paise - discount_paise
+    return discount_paise, final_paise, coupon
+
+
+def _commit_coupon_redemption(coupon: dict, user_id: str, plan_id: str,
+                               billing_period: str, original_paise: int,
+                               discount_paise: int, final_paise: int,
+                               payment_transaction_id: Optional[str] = None,
+                               currency: str = "INR") -> None:
+    """
+    Insert a coupon_redemptions row and increment coupons.current_uses.
+    Best-effort — never raises.
+    """
+    try:
+        supabase_service.table("coupon_redemptions").insert({
+            "coupon_id":             coupon["id"],
+            "user_id":               user_id,
+            "original_amount_paise": original_paise,
+            "discount_amount_paise": discount_paise,
+            "final_amount_paise":    final_paise,
+            "currency":              currency,
+            "payment_transaction_id": payment_transaction_id,
+            "plan_id":               plan_id,
+            "billing_period":        billing_period,
+        }).execute()
+    except Exception:
+        pass  # ignore duplicate / other errors
+
+    try:
+        supabase_service.rpc("increment_coupon_uses", {"coupon_id": coupon["id"]}).execute()
+    except Exception:
+        # Fallback manual increment if RPC not yet created
+        try:
+            supabase_service.table("coupons").update({
+                "current_uses": int(coupon.get("current_uses", 0)) + 1
+            }).eq("id", coupon["id"]).execute()
+        except Exception:
+            pass
+
+
 def _send_payment_email(email: str, plan_name: str, billing_period: str,
                         amount_paise: int, payment_id: str) -> None:
     """Send payment-success email via Resend. Best-effort — never raises."""
@@ -164,6 +235,7 @@ def _send_payment_email(email: str, plan_name: str, billing_period: str,
 class CreateOrderRequest(BaseModel):
     plan_id:        str
     billing_period: Optional[str] = "monthly"
+    coupon_code:    Optional[str] = None
 
 
 @router.post("/payment/create-order")
@@ -205,9 +277,14 @@ def create_order(
         except Exception:
             price_inr = 0
 
-    price_paise = int(price_inr * 100)
+    original_paise = int(price_inr * 100)
 
-    # Zero-price plan — activate directly without Razorpay
+    # Apply coupon (server-side — raises 400 if invalid)
+    discount_paise, price_paise, coupon = _apply_coupon(
+        body.coupon_code, user_id, body.plan_id, billing_period, original_paise
+    )
+
+    # Zero-price plan (or 100% coupon) — activate directly without Razorpay
     if price_paise == 0:
         try:
             supabase_service.table("user_subscriptions").upsert(
@@ -224,6 +301,11 @@ def create_order(
             ).execute()
         except Exception:
             pass
+        if coupon:
+            _commit_coupon_redemption(
+                coupon, user_id, body.plan_id, billing_period,
+                original_paise, discount_paise, 0, currency="INR"
+            )
         return {"error": 0, "free": True, "plan_id": body.plan_id, "message": "Plan activated."}
 
     # Paid plan — create Razorpay order (amount is set SERVER-SIDE, not trusted from frontend)
@@ -244,28 +326,41 @@ def create_order(
         raise HTTPException(status_code=500, detail={"error": 1, "message": f"Failed to create order: {e}"})
 
     # Save pending transaction with server-authoritative values
+    tx_row: dict = {
+        "user_id":           user_id,
+        "plan_id":           body.plan_id,
+        "billing_period":    billing_period,
+        "razorpay_order_id": order["id"],
+        "amount_paise":      price_paise,       # discounted amount locked in
+        "currency":          "INR",
+        "status":            "created",
+    }
+    if coupon:
+        tx_row["coupon_code"]       = coupon["code"]
+        tx_row["coupon_id"]         = coupon["id"]
+        tx_row["discount_paise"]    = discount_paise
+        tx_row["original_paise"]    = original_paise
+
+    tx_id = None
     try:
-        supabase_service.table("payment_transactions").insert({
-            "user_id":           user_id,
-            "plan_id":           body.plan_id,   # locked in at order time
-            "billing_period":    billing_period,
-            "razorpay_order_id": order["id"],
-            "amount_paise":      price_paise,    # locked in at order time
-            "currency":          "INR",
-            "status":            "created",
-        }).execute()
+        ins = supabase_service.table("payment_transactions").insert(tx_row).execute()
+        if ins.data:
+            tx_id = ins.data[0].get("id")
     except Exception:
         pass
 
     return {
-        "error":          0,
-        "order_id":       order["id"],
-        "amount":         order["amount"],
-        "currency":       order["currency"],
-        "plan_id":        body.plan_id,
-        "plan_name":      plan_name,
-        "billing_period": billing_period,
-        "key_id":         _RZP_KEY_ID,
+        "error":           0,
+        "order_id":        order["id"],
+        "amount":          order["amount"],
+        "currency":        order["currency"],
+        "plan_id":         body.plan_id,
+        "plan_name":       plan_name,
+        "billing_period":  billing_period,
+        "key_id":          _RZP_KEY_ID,
+        "original_amount": original_paise,
+        "discount_amount": discount_paise,
+        "coupon_applied":  coupon["code"] if coupon else None,
     }
 
 
@@ -316,11 +411,13 @@ def verify_payment(
     stored_plan_id       = body.plan_id       or "pro"
     stored_billing       = body.billing_period or "monthly"
     stored_amount_paise  = 0
+    stored_coupon        = None
+    stored_tx_id         = None
 
     try:
         tx_res = (
             supabase_service.table("payment_transactions")
-            .select("plan_id, billing_period, amount_paise, user_id")
+            .select("id, plan_id, billing_period, amount_paise, original_paise, discount_paise, coupon_id, coupon_code, user_id")
             .eq("razorpay_order_id", body.razorpay_order_id)
             .eq("status", "created")          # only accept orders that haven't been used
             .execute()
@@ -330,6 +427,15 @@ def verify_payment(
             stored_plan_id       = row["plan_id"]
             stored_billing       = row["billing_period"]
             stored_amount_paise  = int(row["amount_paise"])
+            stored_tx_id         = row.get("id")
+
+            # Load coupon row if one was applied at order time
+            if row.get("coupon_id"):
+                try:
+                    cr = supabase_service.table("coupons").select("*").eq("id", row["coupon_id"]).limit(1).execute()
+                    stored_coupon = cr.data[0] if cr.data else None
+                except Exception:
+                    pass
 
             # Security: ensure this order belongs to the authenticated user
             if row["user_id"] != user_id:
@@ -399,7 +505,19 @@ def verify_payment(
     except Exception:
         pass
 
-    # ── Step 6: Fetch plan display name ──────────────────────────────────────
+    # ── Step 6b: Commit coupon redemption + reward referrer ───────────────────
+    if stored_coupon:
+        _commit_coupon_redemption(
+            stored_coupon, user_id, stored_plan_id, stored_billing,
+            int(tx_res.data[0].get("original_paise") or stored_amount_paise),
+            int(tx_res.data[0].get("discount_paise") or 0),
+            stored_amount_paise,
+            payment_transaction_id=str(stored_tx_id) if stored_tx_id else None,
+            currency="INR",
+        )
+    reward_referrer_after_payment(user_id, stored_plan_id)
+
+    # ── Step 7: Fetch plan display name ──────────────────────────────────────
     plan_name = stored_plan_id.capitalize()
     try:
         pl = supabase_service.table("plans").select("name").eq("id", stored_plan_id).execute()
@@ -533,6 +651,7 @@ class PayPalCreateOrderRequest(BaseModel):
     plan_id:        str
     billing_period: Optional[str] = "monthly"
     country:        Optional[str] = None
+    coupon_code:    Optional[str] = None
 
 
 @router.post("/payment/paypal-create-order")
@@ -549,7 +668,13 @@ def paypal_create_order(
     billing_period       = (body.billing_period or "monthly").lower().strip()
 
     price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
-    currency_code, amount_str, amount_paise = _paypal_order_amount(price_inr)
+    original_paise_pp    = int(price_inr * 100)
+    discount_paise_pp, final_paise_pp, coupon_pp = _apply_coupon(
+        body.coupon_code, user_id, body.plan_id, billing_period, original_paise_pp
+    )
+    price_inr_after = final_paise_pp / 100
+
+    currency_code, amount_str, amount_paise = _paypal_order_amount(price_inr_after)
     if float(amount_str) <= 0:
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
 
@@ -580,29 +705,38 @@ def paypal_create_order(
         raise HTTPException(status_code=500, detail={"error": 1, "message": f"Failed to create PayPal order: {e}"})
 
     # Save pending transaction so verify can look up authoritative values
+    pp_tx_row: dict = {
+        "user_id":         user_id,
+        "plan_id":         body.plan_id,
+        "billing_period":  billing_period,
+        "paypal_order_id": order_data["id"],
+        "amount_paise":    amount_paise,
+        "amount_usd":      float(amount_str) if currency_code == "USD" else None,
+        "currency":        currency_code,
+        "status":          "created",
+        "gateway":         "paypal",
+    }
+    if coupon_pp:
+        pp_tx_row["coupon_code"]    = coupon_pp["code"]
+        pp_tx_row["coupon_id"]      = coupon_pp["id"]
+        pp_tx_row["discount_paise"] = discount_paise_pp
+        pp_tx_row["original_paise"] = original_paise_pp
     try:
-        supabase_service.table("payment_transactions").insert({
-            "user_id":         user_id,
-            "plan_id":         body.plan_id,
-            "billing_period":  billing_period,
-            "paypal_order_id": order_data["id"],
-            "amount_paise":    amount_paise,
-            "amount_usd":      float(amount_str) if currency_code == "USD" else None,
-            "currency":        currency_code,
-            "status":          "created",
-            "gateway":         "paypal",
-        }).execute()
+        supabase_service.table("payment_transactions").insert(pp_tx_row).execute()
     except Exception:
         pass
 
     return {
-        "error":      0,
-        "order_id":   order_data["id"],
-        "amount":     amount_str,
-        "currency":   currency_code,
-        "amount_usd": float(amount_str) if currency_code == "USD" else None,
-        "plan_id":    body.plan_id,
-        "plan_name":  plan_name,
+        "error":           0,
+        "order_id":        order_data["id"],
+        "amount":          amount_str,
+        "currency":        currency_code,
+        "amount_usd":      float(amount_str) if currency_code == "USD" else None,
+        "plan_id":         body.plan_id,
+        "plan_name":       plan_name,
+        "original_amount": original_paise_pp,
+        "discount_amount": discount_paise_pp,
+        "coupon_applied":  coupon_pp["code"] if coupon_pp else None,
     }
 
 
@@ -923,6 +1057,7 @@ class PayUCreateOrderRequest(BaseModel):
     full_name:      Optional[str] = ""
     country:        Optional[str] = ""
     phone:          Optional[str] = ""
+    coupon_code:    Optional[str] = None
 
 
 def _payu_default_success_url() -> str:
@@ -1031,6 +1166,13 @@ def payu_create_order(
     if price_inr <= 0:
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid plan or zero price."})
 
+    # Apply coupon before computing hash — amount must be final before hash
+    payu_original_paise = int(price_inr * 100)
+    payu_discount_paise, payu_final_paise, coupon_payu = _apply_coupon(
+        body.coupon_code, user_id, body.plan_id, billing_period, payu_original_paise
+    )
+    price_inr = payu_final_paise / 100
+
     # PayU India expects INR unless multi-currency is explicitly enabled on the merchant account.
     amount_str = f"{price_inr:.2f}"
 
@@ -1049,17 +1191,23 @@ def payu_create_order(
     hash_val = _payu_hash(txnid, amount_str, productinfo, firstname, user_email)
 
     # Save pending transaction — required for payu-success callback activation.
+    payu_tx_row: dict = {
+        "user_id":        user_id,
+        "plan_id":        body.plan_id,
+        "billing_period": billing_period,
+        "payu_txnid":     txnid,
+        "amount_paise":   payu_final_paise,
+        "currency":       "INR",
+        "status":         "created",
+        "gateway":        "payu",
+    }
+    if coupon_payu:
+        payu_tx_row["coupon_code"]    = coupon_payu["code"]
+        payu_tx_row["coupon_id"]      = coupon_payu["id"]
+        payu_tx_row["discount_paise"] = payu_discount_paise
+        payu_tx_row["original_paise"] = payu_original_paise
     try:
-        supabase_service.table("payment_transactions").insert({
-            "user_id":        user_id,
-            "plan_id":        body.plan_id,
-            "billing_period": billing_period,
-            "payu_txnid":     txnid,
-            "amount_paise":   int(price_inr * 100),
-            "currency":       "INR",
-            "status":         "created",
-            "gateway":        "payu",
-        }).execute()
+        supabase_service.table("payment_transactions").insert(payu_tx_row).execute()
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -1068,8 +1216,11 @@ def payu_create_order(
 
     # PayU requires a POST form submission — return params for frontend to POST
     return {
-        "error":      0,
-        "action_url": f"{_PAYU_BASE}/_payment",
+        "error":           0,
+        "action_url":      f"{_PAYU_BASE}/_payment",
+        "original_amount": payu_original_paise,
+        "discount_amount": payu_discount_paise,
+        "coupon_applied":  coupon_payu["code"] if coupon_payu else None,
         "params": {
             "key":         _PAYU_KEY,
             "txnid":       txnid,
