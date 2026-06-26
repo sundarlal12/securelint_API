@@ -9,7 +9,6 @@ from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 from app.routes.coupons import (
     _validate_coupon_row,
     _compute_discount,
-    reward_referrer_after_payment,
 )
 
 router = APIRouter()
@@ -505,7 +504,7 @@ def verify_payment(
     except Exception:
         pass
 
-    # ── Step 6b: Commit coupon redemption + reward referrer ───────────────────
+    # ── Step 6b: Commit coupon redemption ────────────────────────────────────
     if stored_coupon:
         _commit_coupon_redemption(
             stored_coupon, user_id, stored_plan_id, stored_billing,
@@ -515,7 +514,6 @@ def verify_payment(
             payment_transaction_id=str(stored_tx_id) if stored_tx_id else None,
             currency="INR",
         )
-    reward_referrer_after_payment(user_id, stored_plan_id)
 
     # ── Step 7: Fetch plan display name ──────────────────────────────────────
     plan_name = stored_plan_id.capitalize()
