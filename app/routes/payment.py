@@ -1662,15 +1662,12 @@ def dodo_create_order(
     if body.full_name and body.full_name.strip():
         customer["name"] = body.full_name.strip()
 
-    # amount_cents: pass dynamically so a single PWYW product covers all plans/periods
-    amount_cents = int(amount_usd * 100)
-
     try:
         checkout = client.checkout_sessions.create(
             product_cart=[{
                 "product_id": product_id,
                 "quantity":   1,
-                "amount":     amount_cents,   # dynamic price in cents (PWYW product required)
+                # No 'amount' field — price is set on the product in DodoPayments dashboard
             }],
             customer=customer,
             return_url=f"{_BASE_URL}/user/dashboard/subscription?dodo=success",
