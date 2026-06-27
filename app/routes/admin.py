@@ -97,8 +97,12 @@ def _require_admin(user: dict) -> dict:
 # Canonical incident-type groups  (incidents.type column values)
 # ---------------------------------------------------------------------------
 
-# Core secret masking
-TYPE_SECRETS: set = {"secret_masking"}
+# Secret / masking types
+TYPE_SECRETS: set = {
+    "secret_masking",    # secrets typed/pasted in text fields
+    "console_masking",   # secrets detected in browser console
+    "network_block",     # outbound network request carrying a secret
+}
 
 # Phishing sub-categories
 TYPE_PHISHING_SITE:  set = {"phishing_site", "url_visit"}
@@ -120,7 +124,20 @@ TYPE_EXTENSION: set = {
     "extension_all", "extension_malicious", "extension_blacklist",
 }
 
-# Handy "top-level category" resolver
+# Flat set of every known type → used for validation and filtering
+_ALL_KNOWN_TYPES: set = (
+    TYPE_SECRETS | TYPE_ALL_PHISHING | TYPE_EMAIL_DLP | TYPE_EXTENSION
+)
+
+# Category shortcut keywords accepted by ?severity_type= or ?type=
+_CATEGORY_SHORTCUTS: Dict[str, str] = {
+    "secrets":   "secrets",
+    "phishing":  "phishing",
+    "email_dlp": "email_dlp",
+    "extension": "extension",
+}
+
+
 def _category(incident: dict) -> str:
     """
     Returns one of: secrets | email_dlp | phishing | extension | other
@@ -140,9 +157,37 @@ def _category(incident: dict) -> str:
     st = (incident.get("secret_type") or "").lower()
     if st in {"url_visit", "phishing", "phishing_mail"}:
         return "phishing"
-    if st == "email_recipient":
+    if st in {"email_recipient", "email_dlp"}:
         return "email_dlp"
+    if st in {"secret_masking", "console_masking", "network_block"}:
+        return "secrets"
     return "other" if not t else t_low
+
+
+def _resolve_filter(type_val: Optional[str], severity_type_val: Optional[str]):
+    """
+    Returns (filter_mode, filter_value) where filter_mode is:
+      'exact'    → match incidents where type == filter_value (case-insensitive)
+      'category' → match incidents where _category(i) == filter_value
+      None       → no filter, return all incidents
+    """
+    # ?type= always means exact match on the type column
+    if type_val:
+        v = type_val.strip()
+        # If it's a category keyword, treat as category filter
+        if v.lower() in _CATEGORY_SHORTCUTS:
+            return "category", _CATEGORY_SHORTCUTS[v.lower()]
+        return "exact", v
+
+    # ?severity_type= accepts either category keywords OR exact type values
+    if severity_type_val:
+        v = severity_type_val.strip()
+        if v.lower() in _CATEGORY_SHORTCUTS:
+            return "category", _CATEGORY_SHORTCUTS[v.lower()]
+        # treat as an exact type value
+        return "exact", v
+
+    return None, None
 
 
 def _fetch_org_incidents(org_id: str, type_filter: Optional[str] = None) -> list:
@@ -432,12 +477,13 @@ def admin_incidents_secrets(
     """
     ctx = _require_admin(user)
     try:
-        # Backward-compat: new rows have type='secret_masking';
-        # legacy rows have type=NULL with a non-phishing/non-dlp secret_type.
+        # Backward-compat: new rows have type IN (secret_masking, console_masking,
+        # network_block); legacy rows have type=NULL with a non-phishing/non-dlp secret_type.
         _LEGACY_EXCL = (
             "secret_type.neq.url_visit,"
             "secret_type.neq.phishing,"
             "secret_type.neq.email_recipient,"
+            "secret_type.neq.email_dlp,"
             "secret_type.neq.phishing_mail"
         )
         q = (
@@ -445,7 +491,12 @@ def admin_incidents_secrets(
             .table("incidents")
             .select("*", count="exact")
             .eq("org_id", ctx["org_id"])
-            .or_(f"type.eq.secret_masking,and(type.is.null,{_LEGACY_EXCL})")
+            .or_(
+                f"type.eq.secret_masking,"
+                f"type.eq.console_masking,"
+                f"type.eq.network_block,"
+                f"and(type.is.null,{_LEGACY_EXCL})"
+            )
             .order("timestamp", desc=True)
         )
         if severity:
@@ -890,18 +941,24 @@ def admin_secret_scanner(
     ?secret_type=BASIC_AUTH_URL | AWS_KEY | … to drill into a sub-type.
     """
     ctx = _require_admin(user)
-    # Backward-compat OR: new rows use type='secret_masking';
-    # legacy rows have type=NULL + a non-phishing/non-dlp secret_type.
+    # Backward-compat OR: new rows have type IN (secret_masking, console_masking,
+    # network_block); legacy rows have type=NULL + non-phishing/non-dlp secret_type.
     _LEGACY_SEC_EXCL = (
         "secret_type.neq.url_visit,"
         "secret_type.neq.phishing,"
         "secret_type.neq.email_recipient,"
+        "secret_type.neq.email_dlp,"
         "secret_type.neq.phishing_mail"
     )
     q = (
         _sb().table("incidents").select("*")
         .eq("org_id", ctx["org_id"])
-        .or_(f"type.eq.secret_masking,and(type.is.null,{_LEGACY_SEC_EXCL})")
+        .or_(
+            "type.eq.secret_masking,"
+            "type.eq.console_masking,"
+            "type.eq.network_block,"
+            f"and(type.is.null,{_LEGACY_SEC_EXCL})"
+        )
         .order("timestamp", desc=True)
     )
     if secret_type:
@@ -1646,16 +1703,22 @@ def admin_send_report(body: ReportRequest, user=Depends(verify_supabase_jwt)):
 # ---------------------------------------------------------------------------
 # GET /api/admin/charts  —  chart-ready data
 #
-# Filters (use one or the other):
-#   ?type=<value>          filter on incidents.type column   (e.g. email_dlp,
-#                          secrets_masking, extension_install …)
-#   ?severity_type=        legacy alias: "secrets" | "phishing" | "email_dlp"
+# Both params do the same job — use either:
+#   ?type=<value>           exact type value:  secret_masking | console_masking |
+#                           network_block | email_dlp | phishing_site | url_visit |
+#                           waf_domain | link_hover_phish | Gmail_Phish |
+#                           outlook_phish | extension_install | extension_uninstall |
+#                           extension_sync | extension_all | extension_malicious |
+#                           extension_blacklist
+#                           OR a category shortcut: secrets | phishing | email_dlp | extension
+#
+#   ?severity_type=<value>  same values accepted — kept for backward compatibility
 # ---------------------------------------------------------------------------
 
 @router.get("/admin/charts")
 def admin_charts(
-    type: Optional[str] = Query(None),            # incidents.type column
-    severity_type: Optional[str] = Query(None),   # legacy shorthand
+    type: Optional[str] = Query(None),            # exact type OR category keyword
+    severity_type: Optional[str] = Query(None),   # same — kept for backward compat
     user=Depends(verify_supabase_jwt),
 ):
     ctx = _require_admin(user)
@@ -1664,19 +1727,13 @@ def admin_charts(
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
 
-    # ── Filter by incidents.type column (exact match, e.g. "Gmail_Phish") ─
-    if type:
+    filter_mode, filter_value = _resolve_filter(type, severity_type)
+
+    if filter_mode == "exact":
         incidents = [i for i in all_incidents
-                     if (i.get("type") or "").lower() == type.lower()]
-    # ── Legacy category shortcuts ─────────────────────────────────────────
-    elif severity_type == "phishing":
-        incidents = [i for i in all_incidents if _category(i) == "phishing"]
-    elif severity_type == "email_dlp":
-        incidents = [i for i in all_incidents if _category(i) == "email_dlp"]
-    elif severity_type == "secrets":
-        incidents = [i for i in all_incidents if _category(i) == "secrets"]
-    elif severity_type == "extension":
-        incidents = [i for i in all_incidents if _category(i) == "extension"]
+                     if (i.get("type") or "").lower() == filter_value.lower()]
+    elif filter_mode == "category":
+        incidents = [i for i in all_incidents if _category(i) == filter_value]
     else:
         incidents = all_incidents
 
@@ -1934,6 +1991,8 @@ def admin_charts(
         "active_filter": {
             "type":          type,
             "severity_type": severity_type,
+            "resolved_mode":  filter_mode,    # "exact" | "category" | null
+            "resolved_value": filter_value,   # e.g. "Gmail_Phish" | "phishing"
         },
         # granular: exact incidents.type values (always all incidents)
         "type_breakdown":     dict(type_breakdown),
