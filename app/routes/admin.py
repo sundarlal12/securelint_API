@@ -328,18 +328,21 @@ def admin_dashboard(user=Depends(verify_supabase_jwt)):
 @router.get("/admin/live-threats")
 def admin_live_threats(
     limit: int = Query(50, ge=1, le=200),
-    type: Optional[str] = Query(None),          # filter by incidents.type
+    type: Optional[str] = Query(None),            # filter by incidents.type
+    severity_type: Optional[str] = Query(None),   # alias for type
     severity: Optional[str] = Query(None),
     user=Depends(verify_supabase_jwt),
 ):
     """
     Most recent incidents across all org members.
-    ?type=secret_masking | email_dlp | phishing_site | url_visit |
-          waf_domain | link_hover_phish | Gmail_Phish | outlook_phish |
-          extension_install | extension_malicious | …
+    ?type= or ?severity_type= (interchangeable):
+      secret_masking | console_masking | network_block | email_dlp |
+      phishing_site | url_visit | waf_domain | link_hover_phish |
+      Gmail_Phish | outlook_phish | extension_install | extension_malicious | …
     ?severity=critical | high | medium | low
     """
     ctx = _require_admin(user)
+    effective_type = type or severity_type
 
     q = (
         _sb()
@@ -353,8 +356,8 @@ def admin_live_threats(
         .order("timestamp", desc=True)
         .limit(limit)
     )
-    if type:
-        q = q.eq("type", type)
+    if effective_type:
+        q = q.eq("type", effective_type)
     if severity:
         q = q.eq("severity", severity)
 
@@ -386,8 +389,9 @@ def admin_live_threats(
 
 @router.get("/admin/incidents")
 def admin_incidents(
-    type: Optional[str] = Query(None),           # incidents.type column (primary filter)
-    secret_type: Optional[str] = Query(None),    # incidents.secret_type (specific sub-type)
+    type: Optional[str] = Query(None),            # incidents.type column
+    severity_type: Optional[str] = Query(None),   # alias for type
+    secret_type: Optional[str] = Query(None),     # incidents.secret_type (specific sub-type)
     severity: Optional[str] = Query(None),
     action: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None, alias="from"),
@@ -398,14 +402,14 @@ def admin_incidents(
 ):
     """
     All incidents with optional filters.
-
-    type values:
-      secret_masking | email_dlp | phishing_site | url_visit |
-      waf_domain | link_hover_phish | Gmail_Phish | outlook_phish |
-      extension_install | extension_uninstall | extension_sync |
-      extension_all | extension_malicious | extension_blacklist
+    ?type= and ?severity_type= are interchangeable:
+      secret_masking | console_masking | network_block | email_dlp |
+      phishing_site | url_visit | waf_domain | link_hover_phish |
+      Gmail_Phish | outlook_phish | extension_install | extension_uninstall |
+      extension_sync | extension_all | extension_malicious | extension_blacklist
     """
     ctx = _require_admin(user)
+    effective_type = type or severity_type
 
     query = (
         _sb()
@@ -415,8 +419,8 @@ def admin_incidents(
         .order("timestamp", desc=True)
     )
 
-    if type:
-        query = query.eq("type", type)
+    if effective_type:
+        query = query.eq("type", effective_type)
     if secret_type:
         query = query.eq("secret_type", secret_type)
     if severity:
@@ -545,9 +549,8 @@ def admin_incidents_phishing(
     user=Depends(verify_supabase_jwt),
     page: int = Query(0, ge=0),
     page_size: int = Query(200, ge=1, le=500),
-    # narrow to a specific phishing sub-type
-    type: Optional[str] = Query(None),   # phishing_site | url_visit | waf_domain |
-                                          # link_hover_phish | Gmail_Phish | outlook_phish
+    type: Optional[str] = Query(None),            # narrow to a specific phishing sub-type
+    severity_type: Optional[str] = Query(None),   # alias for type
     severity: Optional[str] = Query(None),
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
@@ -556,9 +559,10 @@ def admin_incidents_phishing(
     All phishing-category incidents.
     Covers: phishing_site, url_visit, waf_domain, link_hover_phish,
             Gmail_Phish (secret_type=phishing_mail), outlook_phish.
-    Use ?type= to narrow to a specific sub-type.
+    ?type= or ?severity_type= (interchangeable) to narrow to a specific sub-type.
     """
     ctx = _require_admin(user)
+    effective_type = type or severity_type
     try:
         # Backward-compat: new rows use the type column;
         # legacy rows have secret_type in (url_visit, phishing, phishing_mail) with type=NULL.
@@ -574,9 +578,8 @@ def admin_incidents_phishing(
             .eq("org_id", ctx["org_id"])
             .order("timestamp", desc=True)
         )
-        if type:
-            # narrow to exact sub-type (still OR with legacy secret_type for that sub-type)
-            q = q.or_(f"type.eq.{type},and(type.is.null,secret_type.eq.{type})")
+        if effective_type:
+            q = q.or_(f"type.eq.{effective_type},and(type.is.null,secret_type.eq.{effective_type})")
         else:
             q = q.or_(_LEGACY_PH_OR)
         if severity:
@@ -931,14 +934,17 @@ def admin_incidents_email_dlp(
 @router.get("/admin/secret-scanner")
 def admin_secret_scanner(
     user=Depends(verify_supabase_jwt),
-    secret_type: Optional[str] = Query(None),   # drill into a specific secret sub-type
+    type: Optional[str] = Query(None),            # narrow to secret sub-type (e.g. secret_masking)
+    severity_type: Optional[str] = Query(None),   # alias for type
+    secret_type: Optional[str] = Query(None),     # specific secret_type value (e.g. BASIC_AUTH_URL)
     severity: Optional[str] = Query(None),
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
 ):
     """
-    Secret-masking incidents (type = 'secret_masking') with analytics.
-    ?secret_type=BASIC_AUTH_URL | AWS_KEY | … to drill into a sub-type.
+    Secret-masking incidents (secret_masking | console_masking | network_block) with analytics.
+    ?type= or ?severity_type= — interchangeable (e.g. secret_masking, console_masking)
+    ?secret_type=BASIC_AUTH_URL | AWS_KEY | … to drill into a specific secret sub-type.
     """
     ctx = _require_admin(user)
     # Backward-compat OR: new rows have type IN (secret_masking, console_masking,
@@ -950,6 +956,9 @@ def admin_secret_scanner(
         "secret_type.neq.email_dlp,"
         "secret_type.neq.phishing_mail"
     )
+    ctx = _require_admin(user)
+    effective_type = type or severity_type  # both params are interchangeable
+
     q = (
         _sb().table("incidents").select("*")
         .eq("org_id", ctx["org_id"])
@@ -961,6 +970,9 @@ def admin_secret_scanner(
         )
         .order("timestamp", desc=True)
     )
+    # If caller specifies a particular secret type (e.g. secret_masking vs console_masking)
+    if effective_type and effective_type.lower() in {s.lower() for s in TYPE_SECRETS}:
+        q = q.eq("type", effective_type)
     if secret_type:
         q = q.eq("secret_type", secret_type)
     if severity:
@@ -1064,15 +1076,18 @@ def admin_browser_protection(user=Depends(verify_supabase_jwt)):
 @router.get("/admin/phishing-stats")
 def admin_phishing_stats(
     user=Depends(verify_supabase_jwt),
-    type: Optional[str] = Query(None),   # narrow to one phishing sub-type
+    type: Optional[str] = Query(None),            # narrow to one phishing sub-type
+    severity_type: Optional[str] = Query(None),   # alias for type
 ):
     """
     Phishing analytics across all phishing-category types:
       phishing_site | url_visit | waf_domain | link_hover_phish |
       Gmail_Phish | outlook_phish
-    ?type= to narrow to a specific sub-type.
+    ?type= or ?severity_type= (interchangeable) to narrow to a specific sub-type.
     """
     ctx = _require_admin(user)
+    effective_type = type or severity_type
+
     # Backward-compat OR: new rows use the type column;
     # legacy phishing rows have secret_type in (url_visit, phishing, phishing_mail) with type=NULL.
     _ALL_PH_CSV = ",".join(sorted(TYPE_ALL_PHISHING))
@@ -1085,8 +1100,8 @@ def admin_phishing_stats(
         .eq("org_id", ctx["org_id"])
         .order("timestamp", desc=True)
     )
-    if type:
-        q = q.or_(f"type.eq.{type},and(type.is.null,secret_type.eq.{type})")
+    if effective_type:
+        q = q.or_(f"type.eq.{effective_type},and(type.is.null,secret_type.eq.{effective_type})")
     else:
         q = q.or_(_LEGACY_PH_OR)
 
