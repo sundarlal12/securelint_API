@@ -28,11 +28,8 @@ _PAYU_BASE      = os.getenv("PAYU_BASE_URL", "")
 _PAYU_SUCCESS   = os.getenv("PAYU_SUCCESS_URL", "")
 _PAYU_FAIL      = os.getenv("PAYU_FAIL_URL",    "")
 
-# ── DodoPayments ──────────────────────────────────────────────────────────────
-_DODO_API_KEY     = os.getenv("DODO_PAYMENTS_API_KEY", "")
-_DODO_ENV         = os.getenv("DODO_PAYMENTS_ENVIRONMENT", "live_mode")
-_DODO_WEBHOOK_KEY = os.getenv("DODO_PAYMENTS_WEBHOOK_KEY", "")
-_DODO_USD_INR     = float(os.getenv("DODO_USD_INR_RATE", "94"))
+# ── DodoPayments — keys read fresh per-request (avoids Vercel import-cache) ───
+_DODO_USD_INR = float(os.getenv("DODO_USD_INR_RATE", "94"))
 
 supabase_service = (
     create_client(SUPABASE_URL, _SERVICE_KEY)
@@ -1512,14 +1509,16 @@ def verify_payu_payment(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _dodo_client():
-    """Return an initialised DodoPayments SDK client."""
-    if not _DODO_API_KEY:
+    """Return an initialised DodoPayments SDK client. Reads env vars fresh each call."""
+    api_key = os.getenv("DODO_PAYMENTS_API_KEY", "")
+    env     = os.getenv("DODO_PAYMENTS_ENVIRONMENT", "live_mode")
+    if not api_key:
         raise HTTPException(
             status_code=500,
-            detail={"error": 1, "message": "DodoPayments API key not configured. Contact support."},
+            detail={"error": 1, "message": "DodoPayments API key not configured (DODO_PAYMENTS_API_KEY). Contact support."},
         )
     from dodopayments import DodoPayments as _DodoSDK
-    return _DodoSDK(bearer_token=_DODO_API_KEY, environment=_DODO_ENV)
+    return _DodoSDK(bearer_token=api_key, environment=env)
 
 
 def _dodo_product_id(plan_id: str, billing_period: str) -> str:
@@ -1735,10 +1734,11 @@ async def dodo_webhook(request: Request):
     raw_body = await request.body()
 
     # Signature verification using webhook secret
-    if _DODO_WEBHOOK_KEY:
+    webhook_key = os.getenv("DODO_PAYMENTS_WEBHOOK_KEY", "")
+    if webhook_key:
         try:
             from dodopayments.webhooks import WebhookVerifier
-            verifier = WebhookVerifier(_DODO_WEBHOOK_KEY)
+            verifier = WebhookVerifier(webhook_key)
             verifier.verify(raw_body, dict(request.headers))
         except Exception:
             raise HTTPException(status_code=401, detail={"error": 1, "message": "Invalid DodoPayments webhook signature."})
