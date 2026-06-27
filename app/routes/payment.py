@@ -32,7 +32,7 @@ _PAYU_FAIL      = os.getenv("PAYU_FAIL_URL",    "")
 _DODO_API_KEY     = os.getenv("DODO_PAYMENTS_API_KEY", "")
 _DODO_ENV         = os.getenv("DODO_PAYMENTS_ENVIRONMENT", "live_mode")
 _DODO_WEBHOOK_KEY = os.getenv("DODO_PAYMENTS_WEBHOOK_KEY", "")
-_DODO_USD_INR     = float(os.getenv("DODO_USD_INR_RATE", "83"))
+_DODO_USD_INR     = float(os.getenv("DODO_USD_INR_RATE", "94"))
 
 supabase_service = (
     create_client(SUPABASE_URL, _SERVICE_KEY)
@@ -1524,14 +1524,18 @@ def _dodo_client():
 
 def _dodo_product_id(plan_id: str, billing_period: str) -> str:
     """
-    Look up the DodoPayments product_id for a given plan + period.
-    Set env vars:
-        DODO_PRODUCT_PRO_MONTHLY   = pdt_xxx
-        DODO_PRODUCT_PRO_QUARTERLY = pdt_yyy
-        DODO_PRODUCT_PRO_ANNUAL    = pdt_zzz
+    Resolve DodoPayments product_id. Priority order:
+      1. DODO_PRODUCT_{PLAN}_{PERIOD}  e.g. DODO_PRODUCT_PRO_MONTHLY
+      2. DODO_PRODUCT_{PLAN}           e.g. DODO_PRODUCT_PRO  (one product for all periods)
+      3. DODO_PRODUCT_ID               single fallback for every plan/period
     """
-    key = f"DODO_PRODUCT_{plan_id.upper()}_{billing_period.upper()}"
-    return os.getenv(key, "")
+    specific = os.getenv(f"DODO_PRODUCT_{plan_id.upper()}_{billing_period.upper()}", "")
+    if specific:
+        return specific
+    plan_default = os.getenv(f"DODO_PRODUCT_{plan_id.upper()}", "")
+    if plan_default:
+        return plan_default
+    return os.getenv("DODO_PRODUCT_ID", "")
 
 
 def _send_dodo_payment_email(email: str, plan_name: str, billing_period: str,
@@ -1630,8 +1634,16 @@ def dodo_create_order(
     if not product_id:
         raise HTTPException(
             status_code=400,
-            detail={"error": 1, "message": f"DodoPayments product not configured for {body.plan_id}/{billing_period}. "
-                                             "Please set DODO_PRODUCT_{PLAN}_{PERIOD} environment variable."},
+            detail={
+                "error": 1,
+                "message": (
+                    f"DodoPayments product not configured for plan='{body.plan_id}' period='{billing_period}'. "
+                    "Set one of these Vercel env vars: "
+                    f"DODO_PRODUCT_{body.plan_id.upper()}_{billing_period.upper()} (specific), "
+                    f"DODO_PRODUCT_{body.plan_id.upper()} (plan-wide), or "
+                    "DODO_PRODUCT_ID (global fallback for all plans)."
+                ),
+            },
         )
 
     # Price reference (for logging; DodoPayments uses its own pre-set product price)
