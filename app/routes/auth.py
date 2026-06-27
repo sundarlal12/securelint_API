@@ -207,13 +207,18 @@ def _is_personal_email(email: str) -> bool:
 def get_plans():
     """Returns all available plans for the signup page."""
     try:
-        res = supabase_service.table("plans").select("id, name, price_monthly").order("price_monthly").execute()
+        res = (
+            supabase_service.table("plans")
+            .select("id, name, price_monthly")
+            .in_("id", ["pro", "enterprise"])
+            .order("price_monthly")
+            .execute()
+        )
         return {"error": 0, "plans": res.data or []}
     except Exception:
         return {"error": 0, "plans": [
-            {"id": "free",       "name": "Free",       "price_monthly": 0},
-            {"id": "pro",        "name": "Pro",         "price_monthly": 2999},
-            {"id": "enterprise", "name": "Enterprise",  "price_monthly": None},
+            {"id": "pro",        "name": "Pro",        "price_monthly": 2999},
+            {"id": "enterprise", "name": "Enterprise", "price_monthly": None},
         ]}
 
 
@@ -238,15 +243,12 @@ def get_plan_pricing(plan_id: Optional[str] = None):
     except Exception as e:
         print(f"[plan-pricing] DB error: {e}")
 
-    # Fallback hardcoded pricing (INR) if table not yet created
+    # Fallback hardcoded pricing (INR) — only pro and enterprise
     fallback = {
         "pro": [
             {"plan_id":"pro","billing_period":"annual",   "price_per_month":1999,"total_price":23988,"discount_pct":33,"badge":"Most popular","savings_label":"33% savings","sort_order":1},
             {"plan_id":"pro","billing_period":"quarterly","price_per_month":2699,"total_price":8097, "discount_pct":10,"badge":"",            "savings_label":"10% savings","sort_order":2},
             {"plan_id":"pro","billing_period":"monthly",  "price_per_month":2999,"total_price":2999, "discount_pct":0, "badge":"",            "savings_label":"",           "sort_order":3},
-        ],
-        "free": [
-            {"plan_id":"free","billing_period":"monthly","price_per_month":0,"total_price":0,"discount_pct":0,"badge":"","savings_label":"","sort_order":1},
         ],
     }
     if plan_id and plan_id.lower() in fallback:
@@ -260,25 +262,28 @@ def get_plan_pricing(plan_id: Optional[str] = None):
 def get_plan_settings(plan: Optional[str] = None):
     """
     Returns features available for a plan from the plan_settings table.
-    ?plan=free        → features for free plan only
-    ?plan=pro         → features for pro plan only
-    ?plan=enterprise  → features for enterprise plan only
-    No param          → all plans grouped by plan_name
+    ?plan=pro         → features for pro plan
+    ?plan=enterprise  → features for enterprise plan
+    No param          → both plans grouped by plan_name
     """
+    # Normalise: free is an alias for pro
+    if plan:
+        plan = "pro" if plan.lower().strip() == "free" else plan.lower().strip()
+
     try:
         q = supabase_service \
             .table("plan_settings") \
-            .select("plan_name, feature, description")
+            .select("plan_name, feature, description") \
+            .in_("plan_name", ["pro", "enterprise"])
 
         if plan:
-            q = q.eq("plan_name", plan.lower().strip())
+            q = q.eq("plan_name", plan)
 
         res = q.order("plan_name").execute()
 
         if not res.data:
             return {"error": 0, "plan_settings": {}}
 
-        # Group features by plan_name
         grouped: dict = {}
         for row in res.data:
             pname = row["plan_name"]
@@ -289,20 +294,15 @@ def get_plan_settings(plan: Optional[str] = None):
                 "description": row.get("description", ""),
             })
 
-        # If a specific plan was requested return flat list, else return all grouped
         if plan:
-            plan_key = plan.lower().strip()
             return {
                 "error":    0,
-                "plan":     plan_key,
-                "features": grouped.get(plan_key, []),
-                "count":    len(grouped.get(plan_key, [])),
+                "plan":     plan,
+                "features": grouped.get(plan, []),
+                "count":    len(grouped.get(plan, [])),
             }
 
-        return {
-            "error":         0,
-            "plan_settings": grouped,
-        }
+        return {"error": 0, "plan_settings": grouped}
 
     except Exception as e:
         return {"error": 1, "message": f"Failed to fetch plan settings: {str(e)}"}
@@ -368,15 +368,17 @@ class SignupRequest(BaseModel):
     email: str
     password: str
     browser_id: str
-    plan_id: Optional[str] = "free"       # "free" | "pro" | "enterprise"
+    plan_id: Optional[str] = "pro"       # "pro" | "enterprise"
     full_name: Optional[str] = None       # required for enterprise
     company_name: Optional[str] = None    # required for enterprise
     ext_id: Optional[str] = None          # Chrome extension ID — present only when called from extension
 
 @router.post("/signup")
 def signup(data: SignupRequest):
-    plan_id = (data.plan_id or "free").lower().strip()
-
+    plan_id = (data.plan_id or "pro").lower().strip()
+    # Treat legacy 'free' as 'pro'
+    if plan_id == "free":
+        plan_id = "pro"
     # ── Enterprise: reject personal email domains ─────────────────────────────
     if plan_id == "enterprise":
         if not data.full_name or not data.full_name.strip():
@@ -863,19 +865,19 @@ def google_signin(data: GoogleSignInRequest):
         _svc_key = os.getenv("SUPABASE_SERVICE_KEY", "") or _SERVICE_KEY
         _svc = create_client(SUPABASE_URL, _svc_key) if _svc_key else supabase_service
 
-        # Subscription — start as inactive (free) until payment
+        # Subscription — start as inactive (pro) until payment
         try:
             _svc.table("user_subscriptions").insert({
-                "user_id": user_id, "plan_id": "free", "status": "inactive",
+                "user_id": user_id, "plan_id": "pro", "status": "inactive",
             }).execute()
         except Exception:
             pass
 
-        # Default settings — all features False until payment confirmed
+        # Default settings
         try:
             from app.core.plan_features import build_settings_row
             _svc.table("user_settings").insert(
-                build_settings_row(user_id, "free", _svc)
+                build_settings_row(user_id, "pro", _svc)
             ).execute()
         except Exception:
             pass

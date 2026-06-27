@@ -62,8 +62,8 @@ def get_user_me(authorization: Optional[str] = Header(None)):
     try:
         plan_res  = supabase_service.table("plans").select("id, name, price_monthly").eq("id", plan_id).execute()
         plan_info = plan_res.data[0] if plan_res.data else {"id": plan_id, "name": plan_id.capitalize(), "price_monthly": 0}
-        if plan_info.get("id") == "free":
-            plan_info["name"] = "Beginner"
+        if plan_info.get("id") in ("free", "pro"):
+            plan_info["name"] = plan_info.get("name") or "Pro"
     except Exception:
         plan_info = {"id": plan_id, "name": plan_id.capitalize(), "price_monthly": 0}
 

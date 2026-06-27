@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Columns that are NOT boolean — always written with a fixed default value.
 # These are skipped when building True/False feature flags.
 _STATIC_FIELDS: Dict[str, Any] = {
-    "masking_style":            "blur",
+    "masking_style":            "smart",
     "site_exclusions":          None,   # ARRAY
     "waf_social_domain":        None,   # ARRAY
     "enterprise_email_domains": None,   # ARRAY
@@ -69,17 +69,20 @@ def _get_all_features(supabase_client) -> Tuple[str, ...]:
 def _fetch_plan_features(plan_id: str, supabase_client) -> List[str]:
     """
     Fetches the list of feature names the plan has access to from plan_settings.
+    'free' is treated as an alias for 'pro' — both plans are identical.
     Raises RuntimeError if the table is unreachable or the plan has no rows.
     """
+    # Normalise: free and pro are the same plan going forward
+    normalised = "pro" if plan_id.lower() == "free" else plan_id.lower()
     res = (
         supabase_client
         .table("plan_settings")
         .select("feature")
-        .eq("plan_name", plan_id.lower())
+        .eq("plan_name", normalised)
         .execute()
     )
     if not res.data:
-        raise RuntimeError(f"No features found in plan_settings for plan='{plan_id}'")
+        raise RuntimeError(f"No features found in plan_settings for plan='{normalised}'")
     return [row["feature"] for row in res.data]
 
 
@@ -88,9 +91,11 @@ def _build_flags(plan_id: str, active_features: set, supabase_client) -> Dict[st
     Builds the full user_settings flags dict dynamically from the schema.
     Boolean columns in active_features → True, all others → False.
     Non-boolean columns written from _STATIC_FIELDS.
+    Normalises plan label: 'free' is stored as 'pro'.
     """
+    normalised = "pro" if plan_id.lower() == "free" else plan_id.lower()
     all_boolean_cols = _get_all_features(supabase_client)
-    flags: Dict[str, Any] = {"Plans": plan_id.lower()}
+    flags: Dict[str, Any] = {"Plans": normalised}
     for col in all_boolean_cols:
         flags[col] = col in active_features
     flags.update(_STATIC_FIELDS)
