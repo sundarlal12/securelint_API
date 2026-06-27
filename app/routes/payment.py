@@ -6,10 +6,7 @@ from typing import Optional, Tuple
 from datetime import datetime, timedelta, timezone
 import os, hmac, hashlib, razorpay, httpx
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
-from app.routes.coupons import (
-    _validate_coupon_row,
-    _compute_discount,
-)
+from app.routes.coupons import _compute_discount
 
 router = APIRouter()
 
@@ -94,14 +91,17 @@ def _verify_rzp_amount(payment_id: str, expected_paise: int) -> bool:
 
 def _apply_coupon(coupon_code: Optional[str], user_id: str,
                   plan_id: str, billing_period: str,
-                  original_paise: int) -> tuple[int, int, Optional[dict]]:
+                  original_paise: int) -> tuple[int, int, Optional[dict], Optional[str]]:
     """
-    Validate and apply a coupon code server-side.
-    Returns (discount_paise, final_paise, coupon_row_or_None).
-    Raises HTTPException(400) if the code is invalid.
+    Validate a coupon and atomically claim it via the claim_coupon() Postgres RPC.
+    The RPC locks the coupon row, re-checks limits, increments current_uses,
+    and inserts a 'pending' redemption record — all in one transaction.
+
+    Returns (discount_paise, final_paise, coupon_row_or_None, redemption_id_or_None).
+    Raises HTTPException(400) if the code is invalid or the claim fails.
     """
     if not coupon_code:
-        return 0, original_paise, None
+        return 0, original_paise, None, None
 
     code = coupon_code.strip().upper()
     try:
@@ -113,49 +113,76 @@ def _apply_coupon(coupon_code: Optional[str], user_id: str,
         raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid coupon code."})
 
     coupon = res.data[0]
-    err = _validate_coupon_row(coupon, user_id, plan_id, billing_period, original_paise)
+
+    # Fast pre-flight checks (expiry, plans, periods) before hitting the RPC
+    from app.routes.coupons import _validate_coupon_row as _preflight
+    err = _preflight(coupon, user_id, plan_id, billing_period, original_paise)
     if err:
         raise HTTPException(status_code=400, detail={"error": 1, "message": err})
 
     discount_paise = _compute_discount(coupon, original_paise)
     final_paise    = original_paise - discount_paise
-    return discount_paise, final_paise, coupon
+
+    # Atomic claim via Postgres RPC — prevents race conditions and double-spend
+    try:
+        rpc_res = supabase_service.rpc("claim_coupon", {
+            "p_coupon_id":      coupon["id"],
+            "p_user_id":        user_id,
+            "p_plan_id":        plan_id,
+            "p_billing_period": billing_period,
+            "p_original_paise": original_paise,
+            "p_discount_paise": discount_paise,
+            "p_final_paise":    final_paise,
+            "p_currency":       "INR",
+        }).execute()
+        result = rpc_res.data
+        if isinstance(result, list):
+            result = result[0] if result else {}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": f"Coupon claim failed: {e}"})
+
+    if not result or not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": result.get("error", "Coupon could not be applied.")},
+        )
+
+    redemption_id = result.get("redemption_id")
+    return discount_paise, final_paise, coupon, redemption_id
 
 
-def _commit_coupon_redemption(coupon: dict, user_id: str, plan_id: str,
-                               billing_period: str, original_paise: int,
-                               discount_paise: int, final_paise: int,
-                               payment_transaction_id: Optional[str] = None,
-                               currency: str = "INR") -> None:
+def _commit_coupon_redemption(redemption_id: Optional[str],
+                               payment_transaction_id: Optional[str]) -> None:
     """
-    Insert a coupon_redemptions row and increment coupons.current_uses.
+    Move a pending coupon redemption to 'committed' after payment is confirmed.
+    Uses the commit_coupon() Postgres RPC for atomicity.
     Best-effort — never raises.
     """
+    if not redemption_id or not payment_transaction_id:
+        return
     try:
-        supabase_service.table("coupon_redemptions").insert({
-            "coupon_id":             coupon["id"],
-            "user_id":               user_id,
-            "original_amount_paise": original_paise,
-            "discount_amount_paise": discount_paise,
-            "final_amount_paise":    final_paise,
-            "currency":              currency,
-            "payment_transaction_id": payment_transaction_id,
-            "plan_id":               plan_id,
-            "billing_period":        billing_period,
+        supabase_service.rpc("commit_coupon", {
+            "p_redemption_id":          redemption_id,
+            "p_payment_transaction_id": str(payment_transaction_id),
         }).execute()
     except Exception:
-        pass  # ignore duplicate / other errors
+        pass
 
+
+def _release_coupon_redemption(redemption_id: Optional[str]) -> None:
+    """
+    Cancel a pending coupon redemption when an order is abandoned or payment fails.
+    Decrements current_uses so the slot is freed for other users.
+    Best-effort — never raises.
+    """
+    if not redemption_id:
+        return
     try:
-        supabase_service.rpc("increment_coupon_uses", {"coupon_id": coupon["id"]}).execute()
+        supabase_service.rpc("release_coupon", {"p_redemption_id": redemption_id}).execute()
     except Exception:
-        # Fallback manual increment if RPC not yet created
-        try:
-            supabase_service.table("coupons").update({
-                "current_uses": int(coupon.get("current_uses", 0)) + 1
-            }).eq("id", coupon["id"]).execute()
-        except Exception:
-            pass
+        pass
 
 
 def _send_payment_email(email: str, plan_name: str, billing_period: str,
@@ -279,7 +306,7 @@ def create_order(
     original_paise = int(price_inr * 100)
 
     # Apply coupon (server-side — raises 400 if invalid)
-    discount_paise, price_paise, coupon = _apply_coupon(
+    discount_paise, price_paise, coupon, redemption_id = _apply_coupon(
         body.coupon_code, user_id, body.plan_id, billing_period, original_paise
     )
 
@@ -300,11 +327,8 @@ def create_order(
             ).execute()
         except Exception:
             pass
-        if coupon:
-            _commit_coupon_redemption(
-                coupon, user_id, body.plan_id, billing_period,
-                original_paise, discount_paise, 0, currency="INR"
-            )
+        if redemption_id:
+            _commit_coupon_redemption(redemption_id, None)
         return {"error": 0, "free": True, "plan_id": body.plan_id, "message": "Plan activated."}
 
     # Paid plan — create Razorpay order (amount is set SERVER-SIDE, not trusted from frontend)
@@ -330,7 +354,7 @@ def create_order(
         "plan_id":           body.plan_id,
         "billing_period":    billing_period,
         "razorpay_order_id": order["id"],
-        "amount_paise":      price_paise,       # discounted amount locked in
+        "amount_paise":      price_paise,
         "currency":          "INR",
         "status":            "created",
     }
@@ -339,6 +363,8 @@ def create_order(
         tx_row["coupon_id"]         = coupon["id"]
         tx_row["discount_paise"]    = discount_paise
         tx_row["original_paise"]    = original_paise
+    if redemption_id:
+        tx_row["coupon_redemption_id"] = redemption_id
 
     tx_id = None
     try:
@@ -506,14 +532,8 @@ def verify_payment(
 
     # ── Step 6b: Commit coupon redemption ────────────────────────────────────
     if stored_coupon:
-        _commit_coupon_redemption(
-            stored_coupon, user_id, stored_plan_id, stored_billing,
-            int(tx_res.data[0].get("original_paise") or stored_amount_paise),
-            int(tx_res.data[0].get("discount_paise") or 0),
-            stored_amount_paise,
-            payment_transaction_id=str(stored_tx_id) if stored_tx_id else None,
-            currency="INR",
-        )
+        stored_redemption_id = tx_res.data[0].get("coupon_redemption_id")
+        _commit_coupon_redemption(stored_redemption_id, str(stored_tx_id) if stored_tx_id else None)
 
     # ── Step 7: Fetch plan display name ──────────────────────────────────────
     plan_name = stored_plan_id.capitalize()
@@ -667,7 +687,7 @@ def paypal_create_order(
 
     price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
     original_paise_pp    = int(price_inr * 100)
-    discount_paise_pp, final_paise_pp, coupon_pp = _apply_coupon(
+    discount_paise_pp, final_paise_pp, coupon_pp, redemption_id_pp = _apply_coupon(
         body.coupon_code, user_id, body.plan_id, billing_period, original_paise_pp
     )
     price_inr_after = final_paise_pp / 100
@@ -719,6 +739,8 @@ def paypal_create_order(
         pp_tx_row["coupon_id"]      = coupon_pp["id"]
         pp_tx_row["discount_paise"] = discount_paise_pp
         pp_tx_row["original_paise"] = original_paise_pp
+    if redemption_id_pp:
+        pp_tx_row["coupon_redemption_id"] = redemption_id_pp
     try:
         supabase_service.table("payment_transactions").insert(pp_tx_row).execute()
     except Exception:
@@ -1166,7 +1188,7 @@ def payu_create_order(
 
     # Apply coupon before computing hash — amount must be final before hash
     payu_original_paise = int(price_inr * 100)
-    payu_discount_paise, payu_final_paise, coupon_payu = _apply_coupon(
+    payu_discount_paise, payu_final_paise, coupon_payu, redemption_id_payu = _apply_coupon(
         body.coupon_code, user_id, body.plan_id, billing_period, payu_original_paise
     )
     price_inr = payu_final_paise / 100
@@ -1204,6 +1226,8 @@ def payu_create_order(
         payu_tx_row["coupon_id"]      = coupon_payu["id"]
         payu_tx_row["discount_paise"] = payu_discount_paise
         payu_tx_row["original_paise"] = payu_original_paise
+    if redemption_id_payu:
+        payu_tx_row["coupon_redemption_id"] = redemption_id_payu
     try:
         supabase_service.table("payment_transactions").insert(payu_tx_row).execute()
     except Exception as e:

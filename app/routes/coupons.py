@@ -4,12 +4,12 @@ Coupon API
 POST /api/coupons/validate  — validate a coupon code and preview the discount
 """
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Request
 from pydantic import BaseModel
 from supabase import create_client
 from typing import Optional
 from datetime import datetime, timezone
-import os
+import os, time, threading
 
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
 
@@ -22,6 +22,33 @@ _svc = (
     if _SERVICE_KEY
     else create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 )
+
+
+# ── In-memory rate limiter (brute-force guard) ────────────────────────────────
+# Allows MAX_ATTEMPTS per user per WINDOW_SECS on /coupons/validate.
+# Serverless-safe: resets on cold start, but still stops automated scripts
+# running within a single function instance.
+
+_rl_lock      = threading.Lock()
+_rl_buckets: dict[str, list[float]] = {}   # user_id → [timestamp, …]
+_RL_MAX       = 15      # max attempts
+_RL_WINDOW    = 60      # per 60 seconds
+_RL_BLOCK     = 300     # block for 5 min after burst
+
+def _rate_limit_check(user_id: str) -> None:
+    """Raise 429 if the user has exceeded the validate rate limit."""
+    now = time.monotonic()
+    with _rl_lock:
+        hits = _rl_buckets.get(user_id, [])
+        # Drop timestamps outside the window
+        hits = [t for t in hits if now - t < _RL_WINDOW]
+        if len(hits) >= _RL_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail={"error": 1, "message": "Too many coupon attempts. Please wait a few minutes."},
+            )
+        hits.append(now)
+        _rl_buckets[user_id] = hits
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -46,7 +73,6 @@ def _compute_discount(coupon: dict, original_paise: int) -> int:
             discount = min(discount, int(float(coupon["max_discount"]) * 100))
     else:  # flat
         discount = int(float(coupon["discount_value"]) * 100)
-
     return min(discount, original_paise)
 
 
@@ -55,8 +81,9 @@ def _validate_coupon_row(coupon: dict, user_id: str,
                          billing_period: Optional[str],
                          original_paise: int) -> str | None:
     """
-    Validate a coupon row against the current purchase context.
-    Returns an error string if invalid, or None if valid.
+    Lightweight pre-flight checks (non-atomic, for fast feedback).
+    The real atomic enforcement happens inside the claim_coupon() RPC.
+    Returns an error string if clearly invalid, None if probably valid.
     """
     now = datetime.now(timezone.utc)
 
@@ -87,23 +114,7 @@ def _validate_coupon_row(coupon: dict, user_id: str,
     if applicable_periods and billing_period and billing_period not in applicable_periods:
         return f"Coupon is not valid for '{billing_period}' billing."
 
-    # Check per-user usage limit
-    uses_per_user = int(coupon.get("uses_per_user") or 1)
-    try:
-        used_res = (
-            _svc.table("coupon_redemptions")
-            .select("id", count="exact")
-            .eq("coupon_id", coupon["id"])
-            .eq("user_id", user_id)
-            .not_.is_("payment_transaction_id", "null")
-            .execute()
-        )
-        if (used_res.count or 0) >= uses_per_user:
-            return "You have already used this coupon."
-    except Exception:
-        pass  # fail-open on DB error
-
-    return None  # all checks passed
+    return None
 
 
 # ── POST /api/coupons/validate ────────────────────────────────────────────────
@@ -120,8 +131,12 @@ def validate_coupon(body: ValidateCouponRequest, authorization: Optional[str] = 
     """
     Validates a coupon / promo code.
     Returns discount info and the final price (preview only — nothing committed).
+    Rate-limited to 15 attempts per user per 60 seconds.
     """
     user_id, _ = _require_user(authorization)
+
+    # Brute-force guard
+    _rate_limit_check(user_id)
 
     code = (body.code or "").strip().upper()
     if not code:
