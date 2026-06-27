@@ -470,39 +470,35 @@ def admin_incidents_secrets(
     user=Depends(verify_supabase_jwt),
     page: int = Query(0, ge=0),
     page_size: int = Query(200, ge=1, le=500),
+    type: Optional[str] = Query(None),            # narrow to one secret sub-type
+    severity_type: Optional[str] = Query(None),   # alias for type
     severity: Optional[str] = Query(None),
-    secret_type: Optional[str] = Query(None),  # sub-type within secret_masking
+    secret_type: Optional[str] = Query(None),     # specific secret_type value
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
 ):
     """
-    Secret-masking incidents only (type = 'secret_masking').
-    Optional ?secret_type= to drill into a specific secret sub-type.
+    Secret-masking incidents (secret_masking | console_masking | network_block).
+    ?type= or ?severity_type= (interchangeable) to narrow to one sub-type.
+    ?secret_type= to filter by a specific secret value (e.g. BASIC_AUTH_URL).
     """
     ctx = _require_admin(user)
+    effective_type = type or severity_type
     try:
-        # Backward-compat: new rows have type IN (secret_masking, console_masking,
-        # network_block); legacy rows have type=NULL with a non-phishing/non-dlp secret_type.
-        _LEGACY_EXCL = (
-            "secret_type.neq.url_visit,"
-            "secret_type.neq.phishing,"
-            "secret_type.neq.email_recipient,"
-            "secret_type.neq.email_dlp,"
-            "secret_type.neq.phishing_mail"
-        )
+        # Step 1 – DB: fetch rows whose type is a known secret type OR type is NULL.
+        # Legacy rows have type=NULL; client-side step 2 will drop non-secret ones.
+        _SECRET_TYPES_CSV = ",".join(sorted(TYPE_SECRETS))
         q = (
             _sb()
             .table("incidents")
             .select("*", count="exact")
             .eq("org_id", ctx["org_id"])
-            .or_(
-                f"type.eq.secret_masking,"
-                f"type.eq.console_masking,"
-                f"type.eq.network_block,"
-                f"and(type.is.null,{_LEGACY_EXCL})"
-            )
+            .or_(f"type.in.({_SECRET_TYPES_CSV}),type.is.null")
             .order("timestamp", desc=True)
         )
+        # Narrow to specific secret sub-type if requested
+        if effective_type and effective_type.lower() in {s.lower() for s in TYPE_SECRETS}:
+            q = q.eq("type", effective_type)
         if severity:
             q = q.eq("severity", severity)
         if secret_type:
@@ -513,8 +509,10 @@ def admin_incidents_secrets(
             q = q.lte("timestamp", _to_iso(end_time, end_of_day=True))
         q = q.range(page * page_size, (page + 1) * page_size - 1)
         res = q.execute()
-        incidents = res.data or []
-        total = res.count or len(incidents)
+        raw = res.data or []
+        # Step 2 – client-side: drop legacy NULL-type rows that aren't actually secrets
+        incidents = [i for i in raw if _category(i) == "secrets"]
+        total = res.count or len(raw)
 
         by_secret_type: Dict[str, int] = defaultdict(int)
         by_severity:    Dict[str, int] = defaultdict(int)
@@ -947,30 +945,18 @@ def admin_secret_scanner(
     ?secret_type=BASIC_AUTH_URL | AWS_KEY | … to drill into a specific secret sub-type.
     """
     ctx = _require_admin(user)
-    # Backward-compat OR: new rows have type IN (secret_masking, console_masking,
-    # network_block); legacy rows have type=NULL + non-phishing/non-dlp secret_type.
-    _LEGACY_SEC_EXCL = (
-        "secret_type.neq.url_visit,"
-        "secret_type.neq.phishing,"
-        "secret_type.neq.email_recipient,"
-        "secret_type.neq.email_dlp,"
-        "secret_type.neq.phishing_mail"
-    )
-    ctx = _require_admin(user)
     effective_type = type or severity_type  # both params are interchangeable
 
+    # Step 1 – DB query: pull rows whose type is a known secret type OR type is NULL
+    # (legacy rows have type=NULL; we'll exclude non-secrets client-side in step 2).
+    _SECRET_TYPES_CSV = ",".join(sorted(TYPE_SECRETS))
     q = (
         _sb().table("incidents").select("*")
         .eq("org_id", ctx["org_id"])
-        .or_(
-            "type.eq.secret_masking,"
-            "type.eq.console_masking,"
-            "type.eq.network_block,"
-            f"and(type.is.null,{_LEGACY_SEC_EXCL})"
-        )
+        .or_(f"type.in.({_SECRET_TYPES_CSV}),type.is.null")
         .order("timestamp", desc=True)
     )
-    # If caller specifies a particular secret type (e.g. secret_masking vs console_masking)
+    # Narrow to one specific secret sub-type if requested
     if effective_type and effective_type.lower() in {s.lower() for s in TYPE_SECRETS}:
         q = q.eq("type", effective_type)
     if secret_type:
@@ -982,7 +968,11 @@ def admin_secret_scanner(
     if end_time:
         q = q.lte("timestamp", _to_iso(end_time, end_of_day=True))
 
-    incidents = q.execute().data or []
+    raw = q.execute().data or []
+
+    # Step 2 – client-side: keep only rows that resolve to the "secrets" category
+    # (this drops legacy rows whose type=NULL but secret_type is phishing/dlp).
+    incidents = [i for i in raw if _category(i) == "secrets"]
 
     by_secret_type: Dict[str, int] = defaultdict(int)
     by_severity:    Dict[str, int] = defaultdict(int)
