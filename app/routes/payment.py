@@ -28,6 +28,12 @@ _PAYU_BASE      = os.getenv("PAYU_BASE_URL", "")
 _PAYU_SUCCESS   = os.getenv("PAYU_SUCCESS_URL", "")
 _PAYU_FAIL      = os.getenv("PAYU_FAIL_URL",    "")
 
+# ── DodoPayments ──────────────────────────────────────────────────────────────
+_DODO_API_KEY     = os.getenv("DODO_PAYMENTS_API_KEY", "")
+_DODO_ENV         = os.getenv("DODO_PAYMENTS_ENVIRONMENT", "live_mode")
+_DODO_WEBHOOK_KEY = os.getenv("DODO_PAYMENTS_WEBHOOK_KEY", "")
+_DODO_USD_INR     = float(os.getenv("DODO_USD_INR_RATE", "83"))
+
 supabase_service = (
     create_client(SUPABASE_URL, _SERVICE_KEY)
     if _SERVICE_KEY
@@ -1499,3 +1505,289 @@ def verify_payu_payment(
         expected_user_id=user_id,
         fallback_email=user_email or body.email or "",
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DodoPayments — international checkout
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dodo_client():
+    """Return an initialised DodoPayments SDK client."""
+    if not _DODO_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": 1, "message": "DodoPayments API key not configured. Contact support."},
+        )
+    from dodopayments import DodoPayments as _DodoSDK
+    return _DodoSDK(bearer_token=_DODO_API_KEY, environment=_DODO_ENV)
+
+
+def _dodo_product_id(plan_id: str, billing_period: str) -> str:
+    """
+    Look up the DodoPayments product_id for a given plan + period.
+    Set env vars:
+        DODO_PRODUCT_PRO_MONTHLY   = pdt_xxx
+        DODO_PRODUCT_PRO_QUARTERLY = pdt_yyy
+        DODO_PRODUCT_PRO_ANNUAL    = pdt_zzz
+    """
+    key = f"DODO_PRODUCT_{plan_id.upper()}_{billing_period.upper()}"
+    return os.getenv(key, "")
+
+
+def _send_dodo_payment_email(email: str, plan_name: str, billing_period: str,
+                              amount_usd: float, payment_id: str) -> None:
+    """Email confirmation for DodoPayments (USD amount)."""
+    if not _RESEND_KEY or not email:
+        return
+    period_label = billing_period.capitalize()
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:system-ui,-apple-system,sans-serif;background:#f9fafb;margin:0;padding:32px 0;">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08);">
+    <div style="background:#0BA37F;padding:32px 40px 28px;">
+      <div style="font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;">SecureLint</div>
+      <div style="font-size:15px;color:#d1fae5;margin-top:4px;">Payment Confirmation</div>
+    </div>
+    <div style="padding:36px 40px;">
+      <h1 style="font-size:24px;font-weight:800;color:#111827;margin:0 0 8px;">🎉 Payment Successful!</h1>
+      <p style="font-size:15px;color:#374151;line-height:1.6;margin:0 0 28px;">
+        Your <strong>{plan_name}</strong> plan is now active. Here are your payment details:
+      </p>
+      <div style="background:#f9fafb;border-radius:8px;padding:20px 24px;margin-bottom:28px;">
+        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+          <tr><td style="padding:6px 0;color:#6b7280;">Plan</td>
+              <td style="padding:6px 0;font-weight:700;color:#111827;text-align:right;">{plan_name}</td></tr>
+          <tr><td style="padding:6px 0;color:#6b7280;">Billing Period</td>
+              <td style="padding:6px 0;font-weight:700;color:#111827;text-align:right;">{period_label}</td></tr>
+          <tr style="border-top:1px solid #e5e7eb;">
+            <td style="padding:10px 0 4px;font-weight:700;color:#111827;font-size:15px;">Amount Paid</td>
+            <td style="padding:10px 0 4px;font-weight:800;color:#0BA37F;font-size:15px;text-align:right;">${amount_usd:.2f} USD</td>
+          </tr>
+        </table>
+        <div style="font-size:12px;color:#9ca3af;margin-top:8px;">Payment ID: {payment_id}</div>
+      </div>
+      <h2 style="font-size:16px;font-weight:700;color:#111827;margin:0 0 12px;">What happens next?</h2>
+      <ul style="margin:0 0 28px;padding-left:20px;font-size:14px;color:#374151;line-height:1.8;">
+        <li>Your browser extension is now unlocked with all <strong>{plan_name}</strong> features</li>
+        <li>Secret detection, phishing protection and DLP are fully active</li>
+        <li>Manage your plan at <a href="{_BASE_URL}/user/dashboard" style="color:#0BA37F;">{_BASE_URL}/user/dashboard</a></li>
+      </ul>
+      <a href="{_BASE_URL}/user/dashboard"
+         style="display:inline-block;background:#0BA37F;color:#fff;font-size:15px;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;">
+        Go to Dashboard →
+      </a>
+    </div>
+    <div style="padding:20px 40px;border-top:1px solid #f0f0f0;font-size:12px;color:#9ca3af;">
+      SecureLint &middot; <a href="mailto:contact@vaptlabs.com" style="color:#9ca3af;">contact@vaptlabs.com</a>
+      &middot; <a href="{_BASE_URL}/refund-policy" style="color:#9ca3af;">Refund Policy</a>
+    </div>
+  </div>
+</body>
+</html>"""
+    try:
+        httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {_RESEND_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    "SecureLint <noreply@securelint.in>",
+                "to":      [email],
+                "subject": f"✅ Payment confirmed — {plan_name} plan activated",
+                "html":    html,
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+# ── POST /api/payment/dodo-create-order ───────────────────────────────────────
+
+class DodoCreateOrderRequest(BaseModel):
+    plan_id:        str
+    billing_period: Optional[str] = "monthly"
+    country:        Optional[str] = None
+    full_name:      Optional[str] = None
+    coupon_code:    Optional[str] = None
+
+
+@router.post("/payment/dodo-create-order")
+def dodo_create_order(
+    body: DodoCreateOrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user_id, user_email = _require_user(authorization)
+
+    if _is_india_country(body.country):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": "DodoPayments is for international payments only. Use Razorpay for India."},
+        )
+
+    billing_period = (body.billing_period or "monthly").lower().strip()
+
+    product_id = _dodo_product_id(body.plan_id, billing_period)
+    if not product_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": f"DodoPayments product not configured for {body.plan_id}/{billing_period}. "
+                                             "Please set DODO_PRODUCT_{PLAN}_{PERIOD} environment variable."},
+        )
+
+    # Price reference (for logging; DodoPayments uses its own pre-set product price)
+    price_inr, plan_name = _lookup_price(body.plan_id, billing_period)
+    original_paise       = int(price_inr * 100)
+    discount_paise, final_paise, coupon, redemption_id = _apply_coupon(
+        body.coupon_code, user_id, body.plan_id, billing_period, original_paise
+    )
+    amount_usd = round((final_paise / 100) / _DODO_USD_INR, 2)
+
+    client = _dodo_client()
+
+    customer: dict = {"email": user_email}
+    if body.full_name and body.full_name.strip():
+        customer["name"] = body.full_name.strip()
+
+    try:
+        checkout = client.checkout_sessions.create(
+            product_cart=[{"product_id": product_id, "quantity": 1}],
+            customer=customer,
+            return_url=f"{_BASE_URL}/user/dashboard/subscription?dodo=success",
+            billing_currency="USD",
+            metadata={
+                "user_id":        user_id,
+                "plan_id":        body.plan_id,
+                "billing_period": billing_period,
+                "amount_usd":     str(amount_usd),
+            },
+        )
+        checkout_url = checkout.checkout_url
+        session_id   = getattr(checkout, "session_id", None)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": 1, "message": f"DodoPayments checkout creation failed: {e}"},
+        )
+
+    # Persist pending transaction
+    tx_row: dict = {
+        "user_id":          user_id,
+        "plan_id":          body.plan_id,
+        "billing_period":   billing_period,
+        "dodo_session_id":  session_id,
+        "amount_paise":     final_paise,
+        "amount_usd":       amount_usd,
+        "currency":         "USD",
+        "status":           "created",
+        "gateway":          "dodopayments",
+    }
+    if coupon:
+        tx_row["coupon_code"]    = coupon["code"]
+        tx_row["coupon_id"]      = coupon["id"]
+        tx_row["discount_paise"] = discount_paise
+        tx_row["original_paise"] = original_paise
+    if redemption_id:
+        tx_row["coupon_redemption_id"] = redemption_id
+    try:
+        supabase_service.table("payment_transactions").insert(tx_row).execute()
+    except Exception:
+        pass
+
+    return {
+        "error":        0,
+        "checkout_url": checkout_url,
+        "session_id":   session_id,
+        "amount_usd":   amount_usd,
+        "plan_name":    plan_name,
+    }
+
+
+# ── POST /api/payment/dodo-webhook ────────────────────────────────────────────
+
+@router.post("/payment/dodo-webhook")
+async def dodo_webhook(request: Request):
+    """
+    Receive DodoPayments webhook events.
+    Register this URL in your DodoPayments dashboard:
+        https://securelint-api.vercel.app/api/payment/dodo-webhook
+    Handles: payment.succeeded, subscription.active
+    """
+    raw_body = await request.body()
+
+    # Signature verification using webhook secret
+    if _DODO_WEBHOOK_KEY:
+        try:
+            from dodopayments.webhooks import WebhookVerifier
+            verifier = WebhookVerifier(_DODO_WEBHOOK_KEY)
+            verifier.verify(raw_body, dict(request.headers))
+        except Exception:
+            raise HTTPException(status_code=401, detail={"error": 1, "message": "Invalid DodoPayments webhook signature."})
+
+    try:
+        import json as _json
+        data = _json.loads(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "Invalid JSON payload."})
+
+    event_type = data.get("type", "")
+    event_data = data.get("data", {})
+    metadata   = event_data.get("metadata", {})
+
+    user_id        = metadata.get("user_id")
+    plan_id        = metadata.get("plan_id")
+    billing_period = metadata.get("billing_period", "monthly")
+    payment_id     = event_data.get("payment_id") or event_data.get("subscription_id", f"dodo_{user_id[:8] if user_id else 'na'}")
+
+    if event_type in ("payment.succeeded", "subscription.active"):
+        if not user_id or not plan_id:
+            return {"ok": True}
+
+        # Activate subscription in Supabase
+        try:
+            supabase_service.table("subscriptions").upsert(
+                {
+                    "user_id":        user_id,
+                    "plan_id":        plan_id,
+                    "billing_period": billing_period,
+                    "status":         "active",
+                    "ends_at":        _ends_at(billing_period),
+                    "gateway":        "dodopayments",
+                    "payment_id":     payment_id,
+                },
+                on_conflict="user_id",
+            ).execute()
+        except Exception:
+            pass
+
+        # Update users table
+        try:
+            supabase_service.table("users").update(
+                {"plan_id": plan_id, "plan_status": "active"}
+            ).eq("id", user_id).execute()
+        except Exception:
+            pass
+
+        # Update payment_transactions status
+        try:
+            session_id = event_data.get("session_id")
+            if session_id:
+                supabase_service.table("payment_transactions").update(
+                    {"status": "paid", "payment_id": payment_id}
+                ).eq("dodo_session_id", session_id).execute()
+        except Exception:
+            pass
+
+        # Send confirmation email
+        try:
+            user_res = supabase_service.table("users").select("email").eq("id", user_id).single().execute()
+            if user_res.data:
+                email = user_res.data.get("email", "")
+                _, plan_name = _lookup_price(plan_id, billing_period)
+                amount_usd   = float(metadata.get("amount_usd", 0))
+                _send_dodo_payment_email(email, plan_name, billing_period, amount_usd, payment_id)
+        except Exception:
+            pass
+
+    return {"ok": True}

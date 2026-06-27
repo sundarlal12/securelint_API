@@ -12,3 +12,4 @@ razorpay
 email-validator
 resend
 google-auth
+dodopayments
