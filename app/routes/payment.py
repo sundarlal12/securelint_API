@@ -1527,7 +1527,9 @@ def _dodo_product_id(plan_id: str, billing_period: str) -> str:
     Resolve DodoPayments product_id. Priority order:
       1. DODO_PRODUCT_{PLAN}_{PERIOD}  e.g. DODO_PRODUCT_PRO_MONTHLY
       2. DODO_PRODUCT_{PLAN}           e.g. DODO_PRODUCT_PRO  (one product for all periods)
-      3. DODO_PRODUCT_ID               single fallback for every plan/period
+      3. DODO_PRODUCT_ID               single PWYW product for every plan/period
+    Recommended: create ONE product with Pay What You Want (PWYW) enabled
+    and set DODO_PRODUCT_ID — the endpoint will pass the amount dynamically.
     """
     specific = os.getenv(f"DODO_PRODUCT_{plan_id.upper()}_{billing_period.upper()}", "")
     if specific:
@@ -1660,9 +1662,16 @@ def dodo_create_order(
     if body.full_name and body.full_name.strip():
         customer["name"] = body.full_name.strip()
 
+    # amount_cents: pass dynamically so a single PWYW product covers all plans/periods
+    amount_cents = int(amount_usd * 100)
+
     try:
         checkout = client.checkout_sessions.create(
-            product_cart=[{"product_id": product_id, "quantity": 1}],
+            product_cart=[{
+                "product_id": product_id,
+                "quantity":   1,
+                "amount":     amount_cents,   # dynamic price in cents (PWYW product required)
+            }],
             customer=customer,
             return_url=f"{_BASE_URL}/user/dashboard/subscription?dodo=success",
             billing_currency="USD",
