@@ -1712,16 +1712,11 @@ def dodo_create_order(
         pass
 
     return {
-        "error":           0,
-        "checkout_url":    checkout_url,
-        "session_id":      session_id,
-        "amount_usd":      amount_usd,
-        "plan_name":       plan_name,
-        # debug fields — remove once confirmed working
-        "_debug_product_id":     product_id,
-        "_debug_billing_period": billing_period,
-        "_debug_plan_id":        body.plan_id,
-        "_debug_env_key":        f"DODO_PRODUCT_{body.plan_id.upper()}_{billing_period.upper()}",
+        "error":        0,
+        "checkout_url": checkout_url,
+        "session_id":   session_id,
+        "amount_usd":   amount_usd,
+        "plan_name":    plan_name,
     }
 
 
