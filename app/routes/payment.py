@@ -1661,6 +1661,11 @@ def dodo_create_order(
     if body.full_name and body.full_name.strip():
         customer["name"] = body.full_name.strip()
 
+    # Build optional discount_codes list from the coupon field
+    dodo_discount_codes = []
+    if body.coupon_code and body.coupon_code.strip():
+        dodo_discount_codes = [body.coupon_code.strip().upper()]
+
     try:
         checkout = client.checkout_sessions.create(
             product_cart=[{
@@ -1676,6 +1681,9 @@ def dodo_create_order(
                 "billing_period": billing_period,
                 "amount_usd":     str(amount_usd),
             },
+            # Show discount code input on checkout; pre-fill if coupon already entered
+            **({"discount_codes": dodo_discount_codes} if dodo_discount_codes else {}),
+            feature_flags={"allow_discount_code": True},
         )
         checkout_url = checkout.checkout_url
         session_id   = getattr(checkout, "session_id", None)
