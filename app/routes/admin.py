@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from supabase import create_client
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 import os
 from collections import defaultdict
@@ -93,17 +93,84 @@ def _require_admin(user: dict) -> dict:
     }
 
 
-def _fetch_org_incidents(org_id: str) -> list:
-    """Fetch all incidents for the org, sorted newest first."""
-    res = (
+# ---------------------------------------------------------------------------
+# Canonical incident-type groups  (incidents.type column values)
+# ---------------------------------------------------------------------------
+
+# Core secret masking
+TYPE_SECRETS: set = {"secret_masking"}
+
+# Phishing sub-categories
+TYPE_PHISHING_SITE:  set = {"phishing_site", "url_visit"}
+TYPE_PHISHING_WAF:   set = {"waf_domain"}
+TYPE_PHISHING_HOVER: set = {"link_hover_phish"}
+TYPE_EMAIL_PHISH:    set = {"Gmail_Phish", "outlook_phish",
+                             "gmail_phish", "outlook_phish"}   # lower-case aliases
+TYPE_ALL_PHISHING:   set = (
+    TYPE_PHISHING_SITE | TYPE_PHISHING_WAF |
+    TYPE_PHISHING_HOVER | TYPE_EMAIL_PHISH
+)
+
+# Email DLP
+TYPE_EMAIL_DLP: set = {"email_dlp"}
+
+# Extension events
+TYPE_EXTENSION: set = {
+    "extension_install", "extension_uninstall", "extension_sync",
+    "extension_all", "extension_malicious", "extension_blacklist",
+}
+
+# Handy "top-level category" resolver
+def _category(incident: dict) -> str:
+    """
+    Returns one of: secrets | email_dlp | phishing | extension | other
+    based on the incidents.type column (falls back to secret_type for legacy rows).
+    """
+    t = (incident.get("type") or "").strip()
+    t_low = t.lower()
+    if t_low in {s.lower() for s in TYPE_SECRETS}:
+        return "secrets"
+    if t_low in {s.lower() for s in TYPE_EMAIL_DLP}:
+        return "email_dlp"
+    if t_low in {s.lower() for s in TYPE_ALL_PHISHING}:
+        return "phishing"
+    if t_low in {s.lower() for s in TYPE_EXTENSION}:
+        return "extension"
+    # legacy fallback via secret_type
+    st = (incident.get("secret_type") or "").lower()
+    if st in {"url_visit", "phishing", "phishing_mail"}:
+        return "phishing"
+    if st == "email_recipient":
+        return "email_dlp"
+    return "other" if not t else t_low
+
+
+def _fetch_org_incidents(org_id: str, type_filter: Optional[str] = None) -> list:
+    """
+    Fetch all incidents for the org, sorted newest first.
+    type_filter: exact match on the incidents.type column (optional).
+    """
+    q = (
         _sb()
         .table("incidents")
         .select("*")
         .eq("org_id", org_id)
         .order("timestamp", desc=True)
-        .execute()
     )
-    return res.data or []
+    if type_filter:
+        q = q.eq("type", type_filter)
+    return q.execute().data or []
+
+
+def _filter_by_type(incidents: list, type_val: Optional[str]) -> list:
+    """
+    Client-side filter on the type column for already-fetched incident lists.
+    Matches case-insensitively. If type_val is None returns the full list.
+    """
+    if not type_val:
+        return incidents
+    t = type_val.lower()
+    return [i for i in incidents if (i.get("type") or "").lower() == t]
 
 
 # ---------------------------------------------------------------------------
@@ -159,27 +226,31 @@ def admin_dashboard(user=Depends(verify_supabase_jwt)):
         "flagged": len(flagged),
     }
 
-    # Top-5 most recent secret incidents (exclude url_visit / phishing / email_recipient)
-    EXCLUDE_TYPES = {"url_visit", "phishing", "email_recipient"}
-    secret_incidents = [
-        i for i in incidents
-        if i.get("secret_type", "").lower() not in EXCLUDE_TYPES
-        and i.get("secret_type")
-    ]
-    # Sort by timestamp descending and take top 5
+    # ── Breakdown by incidents.type column ───────────────────────────────
+    type_breakdown: Dict[str, int] = defaultdict(int)
+    category_breakdown: Dict[str, int] = defaultdict(int)
+    for i in incidents:
+        itype = (i.get("type") or "unknown")
+        type_breakdown[itype] += 1
+        category_breakdown[_category(i)] += 1
+
+    # ── Top-5 most recent secret incidents ────────────────────────────────
+    secret_incidents = [i for i in incidents if _category(i) == "secrets"]
     def _ts(i: dict) -> str:
         return i.get("timestamp") or i.get("created_at") or ""
     secret_incidents.sort(key=_ts, reverse=True)
     recent_secrets = [
         {
-            "id":           i.get("id"),
-            "secret_type":  i.get("secret_type"),
-            "severity":     i.get("severity"),
-            "action":       i.get("action"),
-            "timestamp":    i.get("timestamp"),
-            "user_email":   i.get("user_email"),
-            "tab_title":    i.get("tab_title"),
-            "tab_url":      i.get("tab_url"),
+            "id":            i.get("id"),
+            "type":          i.get("type"),
+            "secret_type":   i.get("secret_type"),
+            "severity":      i.get("severity"),
+            "action":        i.get("action"),
+            "timestamp":     i.get("timestamp"),
+            "user_email":    i.get("user_email"),
+            "tab_title":     i.get("tab_title"),
+            "tab_url":       i.get("tab_url"),
+            "browser_info":  i.get("browser_info"),
         }
         for i in secret_incidents[:5]
     ]
@@ -187,15 +258,19 @@ def admin_dashboard(user=Depends(verify_supabase_jwt)):
     return {
         "error": 0,
         "stats": {
-            "total_incidents":    len(incidents),
+            "total_incidents":     len(incidents),
             "incidents_this_week": len(this_week),
-            "total_devices":      len(devices),
-            "team_members":       len(members),
-            "threats_blocked":    len(blocked),
-            "threats_masked":     len(masked),
-            "critical_incidents": len(critical),
-            "severity_breakdown": dict(severity_counts),
-            "action_breakdown":   action_breakdown,
+            "total_devices":       len(devices),
+            "team_members":        len(members),
+            "threats_blocked":     len(blocked),
+            "threats_masked":      len(masked),
+            "critical_incidents":  len(critical),
+            "severity_breakdown":  dict(severity_counts),
+            "action_breakdown":    action_breakdown,
+            # granular: exact incidents.type values
+            "type_breakdown":      dict(type_breakdown),
+            # rolled-up: secrets | phishing | email_dlp | extension | other
+            "category_breakdown":  dict(category_breakdown),
         },
         "recent_secrets": recent_secrets,
     }
@@ -208,24 +283,55 @@ def admin_dashboard(user=Depends(verify_supabase_jwt)):
 @router.get("/admin/live-threats")
 def admin_live_threats(
     limit: int = Query(50, ge=1, le=200),
-    user=Depends(verify_supabase_jwt)
+    type: Optional[str] = Query(None),          # filter by incidents.type
+    severity: Optional[str] = Query(None),
+    user=Depends(verify_supabase_jwt),
 ):
+    """
+    Most recent incidents across all org members.
+    ?type=secret_masking | email_dlp | phishing_site | url_visit |
+          waf_domain | link_hover_phish | Gmail_Phish | outlook_phish |
+          extension_install | extension_malicious | …
+    ?severity=critical | high | medium | low
+    """
     ctx = _require_admin(user)
 
-    res = (
+    q = (
         _sb()
         .table("incidents")
-        .select("id, user_email, browser_id, tab_url, tab_title, secret_type, severity, action, timestamp, extension_version")
+        .select(
+            "id, type, user_email, browser_id, tab_url, tab_title, "
+            "secret_type, severity, masked_preview, action, "
+            "timestamp, extension_version, browser_info, org_id"
+        )
         .eq("org_id", ctx["org_id"])
         .order("timestamp", desc=True)
         .limit(limit)
-        .execute()
     )
+    if type:
+        q = q.eq("type", type)
+    if severity:
+        q = q.eq("severity", severity)
+
+    rows = q.execute().data or []
+
+    # Attach resolved category to each row
+    for r in rows:
+        r["category"] = _category(r)
+
+    # Counts per type and category in this result set
+    type_counts: Dict[str, int] = defaultdict(int)
+    cat_counts:  Dict[str, int] = defaultdict(int)
+    for r in rows:
+        type_counts[(r.get("type") or "unknown")] += 1
+        cat_counts[r["category"]] += 1
 
     return {
         "error": 0,
-        "incidents": res.data or [],
-        "count": len(res.data or []),
+        "count": len(rows),
+        "type_breakdown": dict(type_counts),
+        "category_breakdown": dict(cat_counts),
+        "incidents": rows,
     }
 
 
@@ -235,38 +341,74 @@ def admin_live_threats(
 
 @router.get("/admin/incidents")
 def admin_incidents(
+    type: Optional[str] = Query(None),           # incidents.type column (primary filter)
+    secret_type: Optional[str] = Query(None),    # incidents.secret_type (specific sub-type)
     severity: Optional[str] = Query(None),
-    secret_type: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None, alias="from"),
     to_date: Optional[str] = Query(None, alias="to"),
-    user=Depends(verify_supabase_jwt)
+    page: int = Query(0, ge=0),
+    page_size: int = Query(200, ge=1, le=500),
+    user=Depends(verify_supabase_jwt),
 ):
+    """
+    All incidents with optional filters.
+
+    type values:
+      secret_masking | email_dlp | phishing_site | url_visit |
+      waf_domain | link_hover_phish | Gmail_Phish | outlook_phish |
+      extension_install | extension_uninstall | extension_sync |
+      extension_all | extension_malicious | extension_blacklist
+    """
     ctx = _require_admin(user)
 
     query = (
         _sb()
         .table("incidents")
-        .select("*")
+        .select("*", count="exact")
         .eq("org_id", ctx["org_id"])
         .order("timestamp", desc=True)
     )
 
-    if severity:
-        query = query.eq("severity", severity)
+    if type:
+        query = query.eq("type", type)
     if secret_type:
         query = query.eq("secret_type", secret_type)
+    if severity:
+        query = query.eq("severity", severity)
+    if action:
+        query = query.eq("action", action)
     if from_date:
-        query = query.gte("timestamp", from_date)
+        query = query.gte("timestamp", _to_iso(from_date, end_of_day=False))
     if to_date:
-        query = query.lte("timestamp", to_date)
+        query = query.lte("timestamp", _to_iso(to_date, end_of_day=True))
 
+    query = query.range(page * page_size, (page + 1) * page_size - 1)
     res = query.execute()
     incidents = res.data or []
+    total = res.count or len(incidents)
+
+    # Per-result breakdowns
+    type_counts: Dict[str, int] = defaultdict(int)
+    cat_counts:  Dict[str, int] = defaultdict(int)
+    sev_counts:  Dict[str, int] = defaultdict(int)
+    for i in incidents:
+        type_counts[(i.get("type") or "unknown")] += 1
+        cat_counts[_category(i)] += 1
+        sev_counts[(i.get("severity") or "unknown")] += 1
+        i["category"] = _category(i)
 
     return {
         "error": 0,
-        "incidents": incidents,
         "count": len(incidents),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, -(-total // page_size)),
+        "type_breakdown": dict(type_counts),
+        "category_breakdown": dict(cat_counts),
+        "severity_breakdown": dict(sev_counts),
+        "incidents": incidents,
     }
 
 
@@ -279,21 +421,37 @@ def admin_incidents_secrets(
     user=Depends(verify_supabase_jwt),
     page: int = Query(0, ge=0),
     page_size: int = Query(200, ge=1, le=500),
+    severity: Optional[str] = Query(None),
+    secret_type: Optional[str] = Query(None),  # sub-type within secret_masking
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
 ):
+    """
+    Secret-masking incidents only (type = 'secret_masking').
+    Optional ?secret_type= to drill into a specific secret sub-type.
+    """
     ctx = _require_admin(user)
     try:
+        # Backward-compat: new rows have type='secret_masking';
+        # legacy rows have type=NULL with a non-phishing/non-dlp secret_type.
+        _LEGACY_EXCL = (
+            "secret_type.neq.url_visit,"
+            "secret_type.neq.phishing,"
+            "secret_type.neq.email_recipient,"
+            "secret_type.neq.phishing_mail"
+        )
         q = (
             _sb()
             .table("incidents")
             .select("*", count="exact")
             .eq("org_id", ctx["org_id"])
-            .neq("secret_type", "url_visit")
-            .neq("secret_type", "phishing")
-            .neq("secret_type", "email_recipient")
+            .or_(f"type.eq.secret_masking,and(type.is.null,{_LEGACY_EXCL})")
             .order("timestamp", desc=True)
         )
+        if severity:
+            q = q.eq("severity", severity)
+        if secret_type:
+            q = q.eq("secret_type", secret_type)
         if start_time:
             q = q.gte("timestamp", _to_iso(start_time, end_of_day=False))
         if end_time:
@@ -303,22 +461,25 @@ def admin_incidents_secrets(
         incidents = res.data or []
         total = res.count or len(incidents)
 
-        by_type = defaultdict(int)
-        by_severity = defaultdict(int)
+        by_secret_type: Dict[str, int] = defaultdict(int)
+        by_severity:    Dict[str, int] = defaultdict(int)
+        by_action:      Dict[str, int] = defaultdict(int)
         for i in incidents:
-            by_type[i.get("secret_type", "unknown")] += 1
-            by_severity[i.get("severity", "unknown")] += 1
+            by_secret_type[(i.get("secret_type") or "unknown")] += 1
+            by_severity[(i.get("severity") or "unknown")] += 1
+            by_action[(i.get("action") or "unknown")] += 1
 
         return {
             "error": 0,
-            "incidents": incidents,
             "count": len(incidents),
             "total": total,
             "page": page,
             "page_size": page_size,
             "total_pages": max(1, -(-total // page_size)),
-            "by_type": dict(by_type),
-            "by_severity": dict(by_severity),
+            "by_secret_type": dict(by_secret_type),
+            "by_severity":    dict(by_severity),
+            "by_action":      dict(by_action),
+            "incidents": incidents,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
@@ -333,19 +494,42 @@ def admin_incidents_phishing(
     user=Depends(verify_supabase_jwt),
     page: int = Query(0, ge=0),
     page_size: int = Query(200, ge=1, le=500),
+    # narrow to a specific phishing sub-type
+    type: Optional[str] = Query(None),   # phishing_site | url_visit | waf_domain |
+                                          # link_hover_phish | Gmail_Phish | outlook_phish
+    severity: Optional[str] = Query(None),
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
 ):
+    """
+    All phishing-category incidents.
+    Covers: phishing_site, url_visit, waf_domain, link_hover_phish,
+            Gmail_Phish (secret_type=phishing_mail), outlook_phish.
+    Use ?type= to narrow to a specific sub-type.
+    """
     ctx = _require_admin(user)
     try:
+        # Backward-compat: new rows use the type column;
+        # legacy rows have secret_type in (url_visit, phishing, phishing_mail) with type=NULL.
+        _ALL_PH_CSV = ",".join(sorted(TYPE_ALL_PHISHING))
+        _LEGACY_PH_OR = (
+            f"type.in.({_ALL_PH_CSV}),"
+            "secret_type.in.(url_visit,phishing,phishing_mail)"
+        )
         q = (
             _sb()
             .table("incidents")
             .select("*", count="exact")
             .eq("org_id", ctx["org_id"])
-            .in_("secret_type", ["url_visit", "phishing"])
             .order("timestamp", desc=True)
         )
+        if type:
+            # narrow to exact sub-type (still OR with legacy secret_type for that sub-type)
+            q = q.or_(f"type.eq.{type},and(type.is.null,secret_type.eq.{type})")
+        else:
+            q = q.or_(_LEGACY_PH_OR)
+        if severity:
+            q = q.eq("severity", severity)
         if start_time:
             q = q.gte("timestamp", _to_iso(start_time, end_of_day=False))
         if end_time:
@@ -355,20 +539,26 @@ def admin_incidents_phishing(
         incidents = res.data or []
         total = res.count or len(incidents)
 
-        status_counts = defaultdict(int)
+        by_type:   Dict[str, int] = defaultdict(int)
+        by_status: Dict[str, int] = defaultdict(int)
+        by_sev:    Dict[str, int] = defaultdict(int)
         for i in incidents:
+            by_type[(i.get("type") or "unknown")] += 1
+            by_sev[(i.get("severity") or "unknown")] += 1
             extra = i.get("extra") or {}
-            status_counts[extra.get("site_status", extra.get("status", "unknown"))] += 1
+            by_status[extra.get("site_status", extra.get("status", "unknown"))] += 1
 
         return {
             "error": 0,
-            "incidents": incidents,
             "count": len(incidents),
             "total": total,
             "page": page,
             "page_size": page_size,
             "total_pages": max(1, -(-total // page_size)),
-            "by_status": dict(status_counts),
+            "by_type":     dict(by_type),
+            "by_status":   dict(by_status),
+            "by_severity": dict(by_sev),
+            "incidents": incidents,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
@@ -616,18 +806,32 @@ def admin_incidents_email_dlp(
     user=Depends(verify_supabase_jwt),
     page: int = Query(0, ge=0),
     page_size: int = Query(200, ge=1, le=500),
+    severity: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
 ):
+    """
+    Email DLP incidents only (type = 'email_dlp').
+    These have secret_type = 'email_recipient' on older rows —
+    both are matched via the type column going forward.
+    """
     ctx = _require_admin(user)
     try:
+        # Backward-compat OR:
+        #   new rows:    type = 'email_dlp'
+        #   legacy rows: secret_type = 'email_dlp' OR 'email_recipient' (older convention)
         q = (
             _sb().table("incidents")
             .select("*", count="exact")
             .eq("org_id", ctx["org_id"])
-            .eq("secret_type", "email_recipient")
+            .or_("type.eq.email_dlp,secret_type.eq.email_dlp,secret_type.eq.email_recipient")
             .order("timestamp", desc=True)
         )
+        if severity:
+            q = q.eq("severity", severity)
+        if action:
+            q = q.eq("action", action)
         if start_time:
             q = q.gte("timestamp", _to_iso(start_time, end_of_day=False))
         if end_time:
@@ -637,22 +841,33 @@ def admin_incidents_email_dlp(
         incidents = res.data or []
         total = res.count or len(incidents)
 
-        by_severity = defaultdict(int)
-        by_action = defaultdict(int)
+        by_severity: Dict[str, int] = defaultdict(int)
+        by_action:   Dict[str, int] = defaultdict(int)
+        recipient_domains: Dict[str, int] = defaultdict(int)
         for i in incidents:
-            by_severity[i.get("severity", "unknown")] += 1
-            by_action[i.get("action", "unknown")] += 1
+            by_severity[(i.get("severity") or "unknown")] += 1
+            by_action[(i.get("action") or "unknown")] += 1
+            for rd in (i.get("recipientDomains") or []):
+                d = rd.get("domain") if isinstance(rd, dict) else str(rd)
+                if d:
+                    recipient_domains[d] += 1
+
+        top_domains = sorted(
+            [{"domain": d, "count": c} for d, c in recipient_domains.items()],
+            key=lambda x: x["count"], reverse=True
+        )[:10]
 
         return {
             "error": 0,
-            "incidents": incidents,
             "count": len(incidents),
             "total": total,
             "page": page,
             "page_size": page_size,
             "total_pages": max(1, -(-total // page_size)),
-            "by_severity": dict(by_severity),
-            "by_action": dict(by_action),
+            "by_severity":   dict(by_severity),
+            "by_action":     dict(by_action),
+            "top_recipient_domains": top_domains,
+            "incidents": incidents,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
@@ -663,24 +878,54 @@ def admin_incidents_email_dlp(
 # ---------------------------------------------------------------------------
 
 @router.get("/admin/secret-scanner")
-def admin_secret_scanner(user=Depends(verify_supabase_jwt)):
+def admin_secret_scanner(
+    user=Depends(verify_supabase_jwt),
+    secret_type: Optional[str] = Query(None),   # drill into a specific secret sub-type
+    severity: Optional[str] = Query(None),
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    """
+    Secret-masking incidents (type = 'secret_masking') with analytics.
+    ?secret_type=BASIC_AUTH_URL | AWS_KEY | … to drill into a sub-type.
+    """
     ctx = _require_admin(user)
-    res = (
-        _sb().table("incidents").select("*")
-        .eq("org_id", ctx["org_id"]).neq("secret_type", "url_visit")
-        .neq("secret_type", "phishing")
-        .order("timestamp", desc=True).execute()
+    # Backward-compat OR: new rows use type='secret_masking';
+    # legacy rows have type=NULL + a non-phishing/non-dlp secret_type.
+    _LEGACY_SEC_EXCL = (
+        "secret_type.neq.url_visit,"
+        "secret_type.neq.phishing,"
+        "secret_type.neq.email_recipient,"
+        "secret_type.neq.phishing_mail"
     )
-    incidents = res.data or []
-    by_type = defaultdict(int)
-    by_severity = defaultdict(int)
-    by_user = defaultdict(int)
-    by_domain = defaultdict(int)
-    by_day = defaultdict(int)
+    q = (
+        _sb().table("incidents").select("*")
+        .eq("org_id", ctx["org_id"])
+        .or_(f"type.eq.secret_masking,and(type.is.null,{_LEGACY_SEC_EXCL})")
+        .order("timestamp", desc=True)
+    )
+    if secret_type:
+        q = q.eq("secret_type", secret_type)
+    if severity:
+        q = q.eq("severity", severity)
+    if start_time:
+        q = q.gte("timestamp", _to_iso(start_time, end_of_day=False))
+    if end_time:
+        q = q.lte("timestamp", _to_iso(end_time, end_of_day=True))
+
+    incidents = q.execute().data or []
+
+    by_secret_type: Dict[str, int] = defaultdict(int)
+    by_severity:    Dict[str, int] = defaultdict(int)
+    by_action:      Dict[str, int] = defaultdict(int)
+    by_user:        Dict[str, int] = defaultdict(int)
+    by_domain:      Dict[str, int] = defaultdict(int)
+    by_day:         Dict[str, int] = defaultdict(int)
     for i in incidents:
-        by_type[i.get("secret_type", "unknown")] += 1
-        by_severity[i.get("severity", "unknown")] += 1
-        by_user[i.get("user_email", "unknown")] += 1
+        by_secret_type[(i.get("secret_type") or "unknown")] += 1
+        by_severity[(i.get("severity") or "unknown")] += 1
+        by_action[(i.get("action") or "unknown")] += 1
+        by_user[(i.get("user_email") or "unknown")] += 1
         try:
             from urllib.parse import urlparse as _up
             d = _up(i.get("tab_url", "")).netloc or i.get("tab_url", "")[:40]
@@ -689,14 +934,18 @@ def admin_secret_scanner(user=Depends(verify_supabase_jwt)):
             pass
         if i.get("timestamp"):
             by_day[i["timestamp"][:10]] += 1
+
     return {
         "error": 0,
         "total_secrets": len(incidents),
-        "by_type": dict(by_type),
-        "by_severity": dict(by_severity),
-        "top_users": [{"email": e, "count": c} for e, c in sorted(by_user.items(), key=lambda x: x[1], reverse=True)[:5]],
-        "top_domains": [{"domain": d, "count": c} for d, c in sorted(by_domain.items(), key=lambda x: x[1], reverse=True)[:5]],
-        "daily_trend": [{"date": d, "count": c} for d, c in sorted(by_day.items())[-30:]],
+        "by_secret_type": dict(by_secret_type),
+        "by_severity":    dict(by_severity),
+        "by_action":      dict(by_action),
+        "top_users":    [{"email": e, "count": c} for e, c in
+                          sorted(by_user.items(),   key=lambda x: x[1], reverse=True)[:10]],
+        "top_domains":  [{"domain": d, "count": c} for d, c in
+                          sorted(by_domain.items(), key=lambda x: x[1], reverse=True)[:10]],
+        "daily_trend":  [{"date": d, "count": c} for d, c in sorted(by_day.items())[-30:]],
         "recent": incidents[:10],
     }
 
@@ -756,23 +1005,48 @@ def admin_browser_protection(user=Depends(verify_supabase_jwt)):
 # ---------------------------------------------------------------------------
 
 @router.get("/admin/phishing-stats")
-def admin_phishing_stats(user=Depends(verify_supabase_jwt)):
+def admin_phishing_stats(
+    user=Depends(verify_supabase_jwt),
+    type: Optional[str] = Query(None),   # narrow to one phishing sub-type
+):
+    """
+    Phishing analytics across all phishing-category types:
+      phishing_site | url_visit | waf_domain | link_hover_phish |
+      Gmail_Phish | outlook_phish
+    ?type= to narrow to a specific sub-type.
+    """
     ctx = _require_admin(user)
-    res = (
-        _sb().table("incidents").select("*")
-        .eq("org_id", ctx["org_id"]).in_("secret_type", ["url_visit", "phishing"])
-        .order("timestamp", desc=True).execute()
+    # Backward-compat OR: new rows use the type column;
+    # legacy phishing rows have secret_type in (url_visit, phishing, phishing_mail) with type=NULL.
+    _ALL_PH_CSV = ",".join(sorted(TYPE_ALL_PHISHING))
+    _LEGACY_PH_OR = (
+        f"type.in.({_ALL_PH_CSV}),"
+        "secret_type.in.(url_visit,phishing,phishing_mail)"
     )
-    incidents = res.data or []
+    q = (
+        _sb().table("incidents").select("*")
+        .eq("org_id", ctx["org_id"])
+        .order("timestamp", desc=True)
+    )
+    if type:
+        q = q.or_(f"type.eq.{type},and(type.is.null,secret_type.eq.{type})")
+    else:
+        q = q.or_(_LEGACY_PH_OR)
+
+    incidents = q.execute().data or []
     now = datetime.now(timezone.utc)
-    by_status = defaultdict(int)
-    by_hour = defaultdict(int)
-    by_day = defaultdict(int)
-    by_domain = defaultdict(int)
-    users_affected = set()
+
+    by_type:   Dict[str, int] = defaultdict(int)
+    by_status: Dict[str, int] = defaultdict(int)
+    by_hour:   Dict[str, int] = defaultdict(int)
+    by_day:    Dict[str, int] = defaultdict(int)
+    by_domain: Dict[str, int] = defaultdict(int)
+    users_affected: set = set()
     blocked_count = 0
     last24h_count = 0
+
     for i in incidents:
+        by_type[(i.get("type") or "unknown")] += 1
         extra = i.get("extra") or {}
         by_status[extra.get("site_status", extra.get("status", "unknown"))] += 1
         if i.get("action") in ("blocked", "danger"):
@@ -795,23 +1069,29 @@ def admin_phishing_stats(user=Depends(verify_supabase_jwt)):
             by_domain[d] += 1
         except Exception:
             pass
+
     members_res = _sb().table("organization_members").select("user_id").eq("org_id", ctx["org_id"]).execute()
     total_members = len(members_res.data or [])
     pct_protected = round(len(users_affected) / total_members * 100, 1) if total_members else 0
+
     return {
         "error": 0,
         "kpis": {
             "total_phishing_incidents": len(incidents),
-            "blocked_last_24h": last24h_count,
-            "threats_blocked": blocked_count,
-            "users_affected": len(users_affected),
+            "blocked_last_24h":  last24h_count,
+            "threats_blocked":   blocked_count,
+            "users_affected":    len(users_affected),
             "pct_users_protected": pct_protected,
-            "total_members": total_members,
+            "total_members":     total_members,
         },
+        "by_type":   dict(by_type),
         "by_status": dict(by_status),
-        "top_domains": sorted([{"domain": d, "count": c} for d, c in by_domain.items()], key=lambda x: x["count"], reverse=True)[:10],
+        "top_domains": sorted(
+            [{"domain": d, "count": c} for d, c in by_domain.items()],
+            key=lambda x: x["count"], reverse=True
+        )[:10],
         "hourly_trend_24h": [{"hour": h, "count": c} for h, c in sorted(by_hour.items())],
-        "daily_trend": [{"date": d, "count": c} for d, c in sorted(by_day.items())[-30:]],
+        "daily_trend":      [{"date": d, "count": c} for d, c in sorted(by_day.items())[-30:]],
     }
 
 
@@ -858,6 +1138,291 @@ def admin_remove_member(member_user_id: str, user=Depends(verify_supabase_jwt)):
         raise HTTPException(status_code=403, detail={"error": 1, "message": "Cannot remove the organization owner"})
     _sb().table("organization_members").delete().eq("org_id", org_id).eq("user_id", member_user_id).execute()
     return {"error": 0, "message": "Member removed from the organization", "removed_user_id": member_user_id}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/org/users  —  all users in the org with profile + stats
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/org/users")
+def admin_org_users(user=Depends(verify_supabase_jwt)):
+    """
+    Returns every member of the caller's org with:
+      - basic profile (email, display_name, role, joined_at)
+      - incident stats (total, critical, last_active)
+      - active plan info
+    """
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    # 1. All org members
+    members_res = (
+        _sb().table("organization_members")
+        .select("user_id, role, joined_at")
+        .eq("org_id", org_id)
+        .execute()
+    )
+    members = members_res.data or []
+    member_ids = [m["user_id"] for m in members]
+
+    # 2. All incidents for org — used to derive email + activity stats
+    incidents = _fetch_org_incidents(org_id)
+
+    # Build per-user maps from incidents
+    email_map: Dict[str, str] = {}
+    inc_count: Dict[str, int] = defaultdict(int)
+    crit_count: Dict[str, int] = defaultdict(int)
+    last_seen: Dict[str, str] = {}
+    type_map: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for i in incidents:
+        uid = i.get("user_id")
+        if not uid:
+            continue
+        email_map.setdefault(uid, i.get("user_email", ""))
+        inc_count[uid] += 1
+        if i.get("severity") == "critical":
+            crit_count[uid] += 1
+        ts = i.get("timestamp") or i.get("created_at") or ""
+        if ts and (uid not in last_seen or ts > last_seen[uid]):
+            last_seen[uid] = ts
+        itype = i.get("type") or i.get("secret_type") or "unknown"
+        type_map[uid][itype] += 1
+
+    # 3. Subscription plan per user (batch fetch by user_ids)
+    plan_map: Dict[str, str] = {}
+    plan_status_map: Dict[str, str] = {}
+    if member_ids:
+        sub_res = (
+            _sb().table("user_subscriptions")
+            .select("user_id, plan_id, status")
+            .in_("user_id", member_ids)
+            .execute()
+        )
+        for s in (sub_res.data or []):
+            plan_map[s["user_id"]] = s.get("plan_id", "pro")
+            plan_status_map[s["user_id"]] = s.get("status", "inactive")
+
+    # 4. Build response rows
+    team: List[Dict[str, Any]] = []
+    for m in members:
+        uid = m["user_id"]
+        team.append({
+            "user_id":            uid,
+            "email":              email_map.get(uid, ""),
+            "role":               m.get("role"),
+            "joined_at":          m.get("joined_at"),
+            "plan":               plan_map.get(uid, "pro"),
+            "plan_status":        plan_status_map.get(uid, "inactive"),
+            "total_incidents":    inc_count[uid],
+            "critical_incidents": crit_count[uid],
+            "last_active":        last_seen.get(uid),
+            "incidents_by_type":  dict(type_map[uid]),
+        })
+
+    # Sort: most active first
+    team.sort(key=lambda x: x["total_incidents"], reverse=True)
+
+    return {
+        "error": 0,
+        "org_id": org_id,
+        "total_members": len(team),
+        "users": team,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/org/settings  —  user_settings for every user in the org
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/org/settings")
+def admin_org_get_settings(
+    user_id_filter: Optional[str] = Query(None, alias="user_id"),
+    user=Depends(verify_supabase_jwt),
+):
+    """
+    Returns user_settings rows for all members of the org.
+    ?user_id=<uuid>  →  single user's settings only
+    """
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    # Resolve org member user_ids
+    members_res = (
+        _sb().table("organization_members")
+        .select("user_id")
+        .eq("org_id", org_id)
+        .execute()
+    )
+    member_ids = [m["user_id"] for m in (members_res.data or [])]
+
+    if not member_ids:
+        return {"error": 0, "org_id": org_id, "count": 0, "settings": []}
+
+    # Optionally filter to a single member
+    if user_id_filter:
+        if user_id_filter not in member_ids:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": 1, "message": "User not found in this organization"},
+            )
+        target_ids = [user_id_filter]
+    else:
+        target_ids = member_ids
+
+    settings_res = (
+        _sb().table("user_settings")
+        .select("*")
+        .in_("user_id", target_ids)
+        .execute()
+    )
+    settings_rows = settings_res.data or []
+
+    # Build email lookup from incidents for display
+    incidents_res = (
+        _sb().table("incidents")
+        .select("user_id, user_email")
+        .eq("org_id", org_id)
+        .limit(500)
+        .execute()
+    )
+    email_map: Dict[str, str] = {}
+    for i in (incidents_res.data or []):
+        email_map.setdefault(i["user_id"], i.get("user_email", ""))
+
+    # Attach email to each settings row for readability
+    for row in settings_rows:
+        row["user_email"] = email_map.get(row.get("user_id", ""), "")
+
+    return {
+        "error": 0,
+        "org_id": org_id,
+        "count": len(settings_rows),
+        "settings": settings_rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/admin/org/settings  —  bulk-update settings for the entire org
+# ---------------------------------------------------------------------------
+
+class OrgSettingsBulkUpdate(BaseModel):
+    """
+    Pass any subset of user_settings fields to update.
+    Omit a field to leave it unchanged.
+    Optional ?user_id query param targets a single member; omit to update all.
+    """
+    show_risk_score: Optional[bool] = None
+    show_recent_activity: Optional[bool] = None
+    animated_charts: Optional[bool] = None
+    auto_refresh: Optional[bool] = None
+    enable_detection: Optional[bool] = None
+    auto_mask_critical: Optional[bool] = None
+    show_notifications: Optional[bool] = None
+    mask_console: Optional[bool] = None
+    scan_large_docs: Optional[bool] = None
+    realtime_updates: Optional[bool] = None
+    auto_mask_editor: Optional[bool] = None
+    global_masking_status: Optional[bool] = None
+    enterprise_data_collection: Optional[bool] = None
+    email_dlp_enabled: Optional[bool] = None
+    masking_style: Optional[str] = None
+    preserve_context: Optional[bool] = None
+    auto_mask_textareas: Optional[bool] = None
+    auto_mask_inputs: Optional[bool] = None
+    overlay_input: Optional[bool] = None
+    overlay_textarea: Optional[bool] = None
+    overlay_editor: Optional[bool] = None
+    block_network_secrets: Optional[bool] = None
+    block_form_submission: Optional[bool] = None
+    aggressive_email_blocking: Optional[bool] = None
+    detect_critical: Optional[bool] = None
+    detect_high: Optional[bool] = None
+    detect_medium: Optional[bool] = None
+    detect_low: Optional[bool] = None
+    notify_critical: Optional[bool] = None
+    notify_high: Optional[bool] = None
+    site_exclusions_status: Optional[bool] = None
+    phish_detection: Optional[bool] = None
+    link_hover_detection: Optional[bool] = None
+    phish_detection_alert: Optional[bool] = None
+    phish_detection_block: Optional[bool] = None
+    domain_age_alert: Optional[bool] = None
+    password_breach_data: Optional[bool] = None
+    extension_scrape_data: Optional[bool] = None
+    waf_social_domain: Optional[list] = None
+    site_exclusions: Optional[list] = None
+    enterprise_email_domains: Optional[list] = None
+    email_dlp_domain: Optional[list] = None
+    email_dlp_action: Optional[str] = None
+    IT_mail: Optional[str] = None
+
+
+@router.put("/admin/org/settings")
+def admin_org_update_settings(
+    body: OrgSettingsBulkUpdate,
+    user_id_filter: Optional[str] = Query(None, alias="user_id"),
+    user=Depends(verify_supabase_jwt),
+):
+    """
+    Bulk-update user_settings for every member of the org.
+    ?user_id=<uuid>  →  update only that member.
+    Only non-null fields from the request body are applied.
+    Returns a summary of how many rows were updated.
+    """
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": "No fields provided to update"},
+        )
+
+    # Resolve members
+    members_res = (
+        _sb().table("organization_members")
+        .select("user_id")
+        .eq("org_id", org_id)
+        .execute()
+    )
+    member_ids = [m["user_id"] for m in (members_res.data or [])]
+
+    if not member_ids:
+        return {"error": 0, "updated": 0, "message": "No members in organization"}
+
+    if user_id_filter:
+        if user_id_filter not in member_ids:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": 1, "message": "User not found in this organization"},
+            )
+        target_ids = [user_id_filter]
+    else:
+        target_ids = member_ids
+
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    updated = 0
+    errors: List[str] = []
+    for uid in target_ids:
+        try:
+            _sb().table("user_settings").upsert(
+                {"user_id": uid, **updates}, on_conflict="user_id"
+            ).execute()
+            updated += 1
+        except Exception as exc:
+            errors.append(f"{uid}: {exc}")
+
+    return {
+        "error": 0 if not errors else 1,
+        "org_id": org_id,
+        "targeted": len(target_ids),
+        "updated": updated,
+        "fields_updated": list(updates.keys()),
+        "errors": errors or None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1079,13 +1644,18 @@ def admin_send_report(body: ReportRequest, user=Depends(verify_supabase_jwt)):
 
 
 # ---------------------------------------------------------------------------
-# GET /api/admin/charts  —  chart-ready data; optional ?severity_type filter
-# severity_type: "secrets" | "phishing" | "email_dlp" (omit = all)
+# GET /api/admin/charts  —  chart-ready data
+#
+# Filters (use one or the other):
+#   ?type=<value>          filter on incidents.type column   (e.g. email_dlp,
+#                          secrets_masking, extension_install …)
+#   ?severity_type=        legacy alias: "secrets" | "phishing" | "email_dlp"
 # ---------------------------------------------------------------------------
 
 @router.get("/admin/charts")
 def admin_charts(
-    severity_type: Optional[str] = Query(None),
+    type: Optional[str] = Query(None),            # incidents.type column
+    severity_type: Optional[str] = Query(None),   # legacy shorthand
     user=Depends(verify_supabase_jwt),
 ):
     ctx = _require_admin(user)
@@ -1094,16 +1664,28 @@ def admin_charts(
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
 
-    # Apply optional type filter
-    PHISHING_TYPES = {"url_visit", "phishing"}
-    if severity_type == "phishing":
-        incidents = [i for i in all_incidents if i.get("secret_type") in PHISHING_TYPES]
+    # ── Filter by incidents.type column (exact match, e.g. "Gmail_Phish") ─
+    if type:
+        incidents = [i for i in all_incidents
+                     if (i.get("type") or "").lower() == type.lower()]
+    # ── Legacy category shortcuts ─────────────────────────────────────────
+    elif severity_type == "phishing":
+        incidents = [i for i in all_incidents if _category(i) == "phishing"]
     elif severity_type == "email_dlp":
-        incidents = [i for i in all_incidents if i.get("secret_type") == "email_recipient"]
+        incidents = [i for i in all_incidents if _category(i) == "email_dlp"]
     elif severity_type == "secrets":
-        incidents = [i for i in all_incidents if i.get("secret_type") not in PHISHING_TYPES and i.get("secret_type") != "email_recipient"]
+        incidents = [i for i in all_incidents if _category(i) == "secrets"]
+    elif severity_type == "extension":
+        incidents = [i for i in all_incidents if _category(i) == "extension"]
     else:
         incidents = all_incidents
+
+    # ── Breakdowns over ALL incidents (not filtered) ─────────────────────
+    type_breakdown:     Dict[str, int] = defaultdict(int)
+    category_breakdown: Dict[str, int] = defaultdict(int)
+    for i in all_incidents:
+        type_breakdown[(i.get("type") or "unknown")] += 1
+        category_breakdown[_category(i)] += 1
 
     now = datetime.now(timezone.utc)
 
@@ -1116,10 +1698,10 @@ def admin_charts(
     DAY_NAMES   = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-    _PHISHING = {"url_visit", "phishing"}
-    secrets  = [i for i in incidents if i.get("secret_type") not in _PHISHING and i.get("secret_type") != "email_recipient"]
-    phishing = [i for i in incidents if i.get("secret_type") in _PHISHING]
-    dlp      = [i for i in incidents if i.get("secret_type") == "email_recipient"]
+    secrets   = [i for i in incidents if _category(i) == "secrets"]
+    phishing  = [i for i in incidents if _category(i) == "phishing"]
+    dlp       = [i for i in incidents if _category(i) == "email_dlp"]
+    extension = [i for i in incidents if _category(i) == "extension"]
 
     # ── 1. Dual trend: incidents vs resolved (last 6 months) ─────────────
     dual = {}
@@ -1162,18 +1744,23 @@ def admin_charts(
     week_activity = [{"n": DAY_NAMES[d], "v": dow_counts[d], "fill": FILL_COLORS[d]} for d in range(7)]
 
     # ── 4. Incident hub stacked bar by weekday ────────────────────────────
-    hub_dow = {d: {"day": DAY_NAMES[d], "secrets": 0, "phishing": 0, "dlp": 0} for d in range(7)}
+    hub_dow = {d: {"day": DAY_NAMES[d], "secrets": 0, "phishing": 0,
+                   "dlp": 0, "extension": 0, "other": 0} for d in range(7)}
     for i in incidents:
         dt = parse_ts(i.get("timestamp", ""))
         if dt:
-            st = i.get("secret_type", "")
+            cat = _category(i)
             d = dt.weekday()
-            if st in ("url_visit", "phishing"):
-                hub_dow[d]["phishing"] += 1
-            elif st == "email_recipient":
-                hub_dow[d]["dlp"] += 1
-            else:
+            if cat == "secrets":
                 hub_dow[d]["secrets"] += 1
+            elif cat == "phishing":
+                hub_dow[d]["phishing"] += 1
+            elif cat == "email_dlp":
+                hub_dow[d]["dlp"] += 1
+            elif cat == "extension":
+                hub_dow[d]["extension"] += 1
+            else:
+                hub_dow[d]["other"] += 1
     hub_weekly = list(hub_dow.values())
 
     # ── 5. 6-week incident trend ──────────────────────────────────────────
@@ -1203,9 +1790,10 @@ def admin_charts(
                     out[key]["count"] += 1
         return list(out.values())
 
-    secrets_daily  = daily_7d(secrets)
-    phishing_daily = daily_7d(phishing)
-    dlp_daily      = daily_7d(dlp)
+    secrets_daily   = daily_7d(secrets)
+    phishing_daily  = daily_7d(phishing)
+    dlp_daily       = daily_7d(dlp)
+    extension_daily = daily_7d(extension)
 
     # ── 7. Secret scanner monthly trend ──────────────────────────────────
     sec_monthly = {}
@@ -1343,19 +1931,27 @@ def admin_charts(
 
     return {
         "error": 0,
-        "severity_type": severity_type,
+        "active_filter": {
+            "type":          type,
+            "severity_type": severity_type,
+        },
+        # granular: exact incidents.type values (always all incidents)
+        "type_breakdown":     dict(type_breakdown),
+        # rolled-up: secrets | phishing | email_dlp | extension | other
+        "category_breakdown": dict(category_breakdown),
         "threat_analytics": {
-            "dual_trend":   dual_trend,
-            "heat_cells":   heat_cells,
+            "dual_trend":    dual_trend,
+            "heat_cells":    heat_cells,
             "week_activity": week_activity,
         },
         "incident_reports": {
-            "hub_weekly":       hub_weekly,
-            "six_week_trend":   six_week_trend,
-            "secrets_daily_7d": secrets_daily,
-            "phishing_daily_7d": phishing_daily,
-            "dlp_daily_7d":     dlp_daily,
-            "dlp_weekly_trend": dlp_weekly_trend,
+            "hub_weekly":           hub_weekly,
+            "six_week_trend":       six_week_trend,
+            "secrets_daily_7d":     secrets_daily,
+            "phishing_daily_7d":    phishing_daily,
+            "dlp_daily_7d":         dlp_daily,
+            "extension_daily_7d":   extension_daily,
+            "dlp_weekly_trend":     dlp_weekly_trend,
         },
         "secret_scanner": {
             "trend_data": secret_trend,
@@ -1363,16 +1959,16 @@ def admin_charts(
             "repo_data":  repo_data,
         },
         "phishing_monitoring": {
-            "volume_24h":    phishing_volume_24h,
-            "weekly_trend":  weekly_phishing_trend,
-            "attack_types":  attack_types,
-            "top_targeted":  top_targeted,
+            "volume_24h":   phishing_volume_24h,
+            "weekly_trend": weekly_phishing_trend,
+            "attack_types": attack_types,
+            "top_targeted": top_targeted,
         },
         "browser_protection": {
-            "safe_data":         list(safe_monthly.values()),
-            "blocked_data":      list(blocked_monthly.values()),
-            "pie_data":          browser_pie,
-            "phish_trend_data":  list(ph_monthly.values()),
+            "safe_data":        list(safe_monthly.values()),
+            "blocked_data":     list(blocked_monthly.values()),
+            "pie_data":         browser_pie,
+            "phish_trend_data": list(ph_monthly.values()),
         },
         "team_activity": {
             "activity_data": team_activity,
