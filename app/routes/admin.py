@@ -122,6 +122,7 @@ TYPE_EMAIL_DLP: set = {"email_dlp"}
 TYPE_EXTENSION: set = {
     "extension_install", "extension_uninstall", "extension_sync",
     "extension_all", "extension_malicious", "extension_blacklist",
+    "blacklist_extensions_visit",
 }
 
 # Flat set of every known type → used for validation and filtering
