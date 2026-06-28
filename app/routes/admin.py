@@ -1158,6 +1158,199 @@ def admin_phishing_stats(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/admin/incidents/extension  —  paginated extension event incidents
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/incidents/extension")
+def admin_incidents_extension(
+    user=Depends(verify_supabase_jwt),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(200, ge=1, le=500),
+    type: Optional[str] = Query(None),            # narrow to one extension sub-type
+    severity_type: Optional[str] = Query(None),   # alias for type
+    severity: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    """
+    Extension-related incidents for the org.
+
+    type / severity_type (interchangeable) — omit for all extension events:
+      extension_install | extension_uninstall | extension_sync |
+      extension_all | extension_malicious | extension_blacklist
+    """
+    ctx = _require_admin(user)
+    effective_type = type or severity_type
+
+    try:
+        _EXT_TYPES_CSV = ",".join(sorted(TYPE_EXTENSION))
+        q = (
+            _sb().table("incidents")
+            .select("*", count="exact")
+            .eq("org_id", ctx["org_id"])
+            .in_("type", list(TYPE_EXTENSION))
+            .order("timestamp", desc=True)
+        )
+        if effective_type:
+            q = q.eq("type", effective_type)
+        if severity:
+            q = q.eq("severity", severity)
+        if action:
+            q = q.eq("action", action)
+        if start_time:
+            q = q.gte("timestamp", _to_iso(start_time, end_of_day=False))
+        if end_time:
+            q = q.lte("timestamp", _to_iso(end_time, end_of_day=True))
+        q = q.range(page * page_size, (page + 1) * page_size - 1)
+        res = q.execute()
+        incidents = res.data or []
+        total = res.count or len(incidents)
+
+        by_type:    Dict[str, int] = defaultdict(int)
+        by_severity: Dict[str, int] = defaultdict(int)
+        by_action:  Dict[str, int] = defaultdict(int)
+        by_user:    Dict[str, int] = defaultdict(int)
+        for i in incidents:
+            by_type[(i.get("type") or "unknown")] += 1
+            by_severity[(i.get("severity") or "unknown")] += 1
+            by_action[(i.get("action") or "unknown")] += 1
+            by_user[(i.get("user_email") or "unknown")] += 1
+
+        top_users = sorted(
+            [{"email": e, "count": c} for e, c in by_user.items()],
+            key=lambda x: x["count"], reverse=True
+        )[:10]
+
+        return {
+            "error": 0,
+            "count": len(incidents),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": max(1, -(-total // page_size)),
+            "by_type":     dict(by_type),
+            "by_severity": dict(by_severity),
+            "by_action":   dict(by_action),
+            "top_users":   top_users,
+            "incidents":   incidents,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/extension-stats  —  analytics summary for extension events
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/extension-stats")
+def admin_extension_stats(
+    user=Depends(verify_supabase_jwt),
+    type: Optional[str] = Query(None),            # narrow to one sub-type
+    severity_type: Optional[str] = Query(None),   # alias for type
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    """
+    Analytics summary for all extension-category incidents.
+    ?type= or ?severity_type= (interchangeable) to narrow to a specific sub-type:
+      extension_install | extension_uninstall | extension_sync |
+      extension_all | extension_malicious | extension_blacklist
+    """
+    ctx = _require_admin(user)
+    effective_type = type or severity_type
+
+    q = (
+        _sb().table("incidents").select("*")
+        .eq("org_id", ctx["org_id"])
+        .in_("type", list(TYPE_EXTENSION))
+        .order("timestamp", desc=True)
+    )
+    if effective_type:
+        q = q.eq("type", effective_type)
+    if start_time:
+        q = q.gte("timestamp", _to_iso(start_time, end_of_day=False))
+    if end_time:
+        q = q.lte("timestamp", _to_iso(end_time, end_of_day=True))
+
+    incidents = q.execute().data or []
+    now = datetime.now(timezone.utc)
+
+    by_type:      Dict[str, int] = defaultdict(int)
+    by_severity:  Dict[str, int] = defaultdict(int)
+    by_action:    Dict[str, int] = defaultdict(int)
+    by_user:      Dict[str, int] = defaultdict(int)
+    by_day:       Dict[str, int] = defaultdict(int)
+    by_hour:      Dict[str, int] = defaultdict(int)
+    malicious_count = 0
+    blacklisted_count = 0
+    last24h_count = 0
+    users_affected: set = set()
+
+    for i in incidents:
+        t = (i.get("type") or "unknown")
+        by_type[t] += 1
+        by_severity[(i.get("severity") or "unknown")] += 1
+        by_action[(i.get("action") or "unknown")] += 1
+        by_user[(i.get("user_email") or "unknown")] += 1
+        if t == "extension_malicious":
+            malicious_count += 1
+        if t == "extension_blacklist":
+            blacklisted_count += 1
+        if i.get("user_id"):
+            users_affected.add(i["user_id"])
+        ts = i.get("timestamp")
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt >= now - timedelta(hours=24):
+                    last24h_count += 1
+                    by_hour[dt.strftime("%H:00")] += 1
+                by_day[ts[:10]] += 1
+            except Exception:
+                pass
+
+    # Extension details from the extensions JSONB column
+    by_extension: Dict[str, int] = defaultdict(int)
+    for i in incidents:
+        ext = i.get("extensions")
+        if isinstance(ext, list):
+            for e in ext:
+                name = e.get("name") or e.get("id") or "unknown"
+                by_extension[name] += 1
+        elif isinstance(ext, dict):
+            name = ext.get("name") or ext.get("id") or "unknown"
+            by_extension[name] += 1
+
+    top_extensions = sorted(
+        [{"extension": k, "count": v} for k, v in by_extension.items()],
+        key=lambda x: x["count"], reverse=True
+    )[:10]
+    top_users = sorted(
+        [{"email": e, "count": c} for e, c in by_user.items()],
+        key=lambda x: x["count"], reverse=True
+    )[:10]
+
+    return {
+        "error": 0,
+        "kpis": {
+            "total_extension_events": len(incidents),
+            "malicious_detected":     malicious_count,
+            "blacklisted_detected":   blacklisted_count,
+            "events_last_24h":        last24h_count,
+            "users_affected":         len(users_affected),
+        },
+        "by_type":         dict(by_type),
+        "by_severity":     dict(by_severity),
+        "by_action":       dict(by_action),
+        "top_extensions":  top_extensions,
+        "top_users":       top_users,
+        "hourly_trend_24h": [{"hour": h, "count": c} for h, c in sorted(by_hour.items())],
+        "daily_trend":      [{"date": d, "count": c} for d, c in sorted(by_day.items())[-30:]],
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /api/admin/members/invite
 # ---------------------------------------------------------------------------
 
