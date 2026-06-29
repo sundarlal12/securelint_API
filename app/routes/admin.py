@@ -2233,3 +2233,667 @@ def admin_charts(
             "score_trend":   score_trend,
         },
     }
+
+
+# ===========================================================================
+# RISK & THREAT INTELLIGENCE
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/risk-score  —  org-level risk score (0–100)
+# ---------------------------------------------------------------------------
+
+def _compute_risk_score(incidents: list, total_members: int) -> dict:
+    """
+    Heuristic risk score (0-100).
+    Higher score = higher risk.
+    Factors: severity mix, unblocked critical/high, phishing rate, malicious extensions.
+    """
+    if not incidents:
+        return {"score": 0, "grade": "A", "factors": []}
+
+    total = len(incidents)
+    critical = sum(1 for i in incidents if i.get("severity") == "critical")
+    high     = sum(1 for i in incidents if i.get("severity") == "high")
+    blocked  = sum(1 for i in incidents if i.get("action") in ("blocked", "masked"))
+    unblocked_serious = sum(
+        1 for i in incidents
+        if i.get("severity") in ("critical", "high") and i.get("action") not in ("blocked", "masked")
+    )
+    phishing_count  = sum(1 for i in incidents if _category(i) == "phishing")
+    malicious_count = sum(1 for i in incidents if i.get("type") == "extension_malicious")
+    dlp_count       = sum(1 for i in incidents if _category(i) == "email_dlp")
+
+    score = 0
+    factors = []
+
+    # Severity weight (max 40 pts)
+    sev_score = min(40, round((critical * 4 + high * 2) / max(total, 1) * 40))
+    if sev_score > 0:
+        score += sev_score
+        factors.append({"factor": "High/Critical severity incidents", "contribution": sev_score})
+
+    # Unblocked serious incidents (max 25 pts)
+    unblock_score = min(25, round(unblocked_serious / max(total, 1) * 25 * 2))
+    if unblock_score > 0:
+        score += unblock_score
+        factors.append({"factor": "Unblocked critical/high incidents", "contribution": unblock_score})
+
+    # Phishing exposure (max 15 pts)
+    ph_score = min(15, round(phishing_count / max(total, 1) * 15))
+    if ph_score > 0:
+        score += ph_score
+        factors.append({"factor": "Phishing exposure", "contribution": ph_score})
+
+    # Malicious extensions (max 12 pts)
+    mal_score = min(12, malicious_count * 4)
+    if mal_score > 0:
+        score += mal_score
+        factors.append({"factor": "Malicious extensions detected", "contribution": mal_score})
+
+    # Email DLP leakage (max 8 pts)
+    dlp_score = min(8, round(dlp_count / max(total, 1) * 8))
+    if dlp_score > 0:
+        score += dlp_score
+        factors.append({"factor": "Email DLP events", "contribution": dlp_score})
+
+    score = min(100, score)
+    if score >= 75:
+        grade = "D"
+    elif score >= 50:
+        grade = "C"
+    elif score >= 25:
+        grade = "B"
+    else:
+        grade = "A"
+
+    return {"score": score, "grade": grade, "factors": sorted(factors, key=lambda x: x["contribution"], reverse=True)}
+
+
+@router.get("/admin/risk-score")
+def admin_risk_score(user=Depends(verify_supabase_jwt)):
+    """
+    Org-level risk score (0-100) + grade (A/B/C/D) + top risk factors.
+    Also includes a 7-day trend comparison.
+    """
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    all_incidents = _fetch_org_incidents(org_id)
+    now = datetime.now(timezone.utc)
+    week_ago  = now - timedelta(days=7)
+    two_weeks = now - timedelta(days=14)
+
+    this_week = [i for i in all_incidents if _parse_ts(i) and _parse_ts(i) >= week_ago]
+    last_week = [
+        i for i in all_incidents
+        if _parse_ts(i) and two_weeks <= _parse_ts(i) < week_ago
+    ]
+
+    members_res = _sb().table("organization_members").select("user_id").eq("org_id", org_id).execute()
+    total_members = len(members_res.data or [])
+
+    current  = _compute_risk_score(all_incidents, total_members)
+    prev_week = _compute_risk_score(last_week, total_members)
+
+    return {
+        "error": 0,
+        "risk_score":      current["score"],
+        "grade":           current["grade"],
+        "trend_7d":        current["score"] - prev_week["score"],
+        "top_risk_factors": current["factors"],
+        "total_incidents": len(all_incidents),
+        "this_week_count": len(this_week),
+    }
+
+
+def _parse_ts(i: dict):
+    ts = i.get("timestamp") or i.get("created_at") or ""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/risk-score/users  —  per-user risk scores, ranked
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/risk-score/users")
+def admin_risk_score_users(user=Depends(verify_supabase_jwt)):
+    """
+    Risk score for every org member, ranked highest risk first.
+    Uses incident severity, unblocked count, and malicious extension events.
+    """
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    incidents = _fetch_org_incidents(org_id)
+    members_res = _sb().table("organization_members").select("user_id, role").eq("org_id", org_id).execute()
+    members = members_res.data or []
+
+    # Build per-user incident map
+    user_incidents: Dict[str, list] = defaultdict(list)
+    email_map: Dict[str, str] = {}
+    for i in incidents:
+        uid = i.get("user_id")
+        if uid:
+            user_incidents[uid].append(i)
+            email_map.setdefault(uid, i.get("user_email", ""))
+
+    ranked = []
+    for m in members:
+        uid = m["user_id"]
+        u_incidents = user_incidents.get(uid, [])
+        risk = _compute_risk_score(u_incidents, 1)
+        ranked.append({
+            "user_id":         uid,
+            "email":           email_map.get(uid, ""),
+            "role":            m.get("role"),
+            "risk_score":      risk["score"],
+            "grade":           risk["grade"],
+            "top_factors":     risk["factors"][:3],
+            "total_incidents": len(u_incidents),
+            "critical_count":  sum(1 for i in u_incidents if i.get("severity") == "critical"),
+            "high_count":      sum(1 for i in u_incidents if i.get("severity") == "high"),
+        })
+
+    ranked.sort(key=lambda x: x["risk_score"], reverse=True)
+    return {"error": 0, "count": len(ranked), "users": ranked}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/threat-trends  —  month-over-month counts by category
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/threat-trends")
+def admin_threat_trends(
+    months: int = Query(6, ge=1, le=12),
+    user=Depends(verify_supabase_jwt),
+):
+    """
+    Monthly incident counts per category for the last N months (default 6).
+    Categories: secrets | phishing | email_dlp | extension | other
+    ?months=3|6|12
+    """
+    ctx = _require_admin(user)
+    incidents = _fetch_org_incidents(ctx["org_id"])
+    now = datetime.now(timezone.utc)
+
+    MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    # Build ordered month buckets
+    month_keys: List[str] = []
+    for m in range(months - 1, -1, -1):
+        target = now.replace(day=1) - timedelta(days=m * 30)
+        month_keys.append(f"{MONTH_NAMES[target.month - 1]} {target.year}")
+
+    # Zero-filled structure
+    data: Dict[str, Dict[str, int]] = {
+        mk: {"secrets": 0, "phishing": 0, "email_dlp": 0, "extension": 0, "other": 0, "total": 0}
+        for mk in month_keys
+    }
+
+    for i in incidents:
+        dt = _parse_ts(i)
+        if not dt:
+            continue
+        mk = f"{MONTH_NAMES[dt.month - 1]} {dt.year}"
+        if mk not in data:
+            continue
+        cat = _category(i)
+        data[mk][cat] = data[mk].get(cat, 0) + 1
+        data[mk]["total"] += 1
+
+    trend = [{"month": mk, **counts} for mk, counts in data.items()]
+
+    # Month-over-month delta for most recent two months
+    delta = {}
+    if len(trend) >= 2:
+        curr, prev = trend[-1], trend[-2]
+        for cat in ("secrets", "phishing", "email_dlp", "extension", "total"):
+            p = prev.get(cat, 0) or 1
+            delta[cat] = round((curr.get(cat, 0) - prev.get(cat, 0)) / p * 100, 1)
+
+    return {
+        "error": 0,
+        "months": months,
+        "trend": trend,
+        "mom_change_pct": delta,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/top-threats  —  top N incidents by severity + recency
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/top-threats")
+def admin_top_threats(
+    limit: int = Query(10, ge=1, le=50),
+    severity: Optional[str] = Query(None),
+    type: Optional[str] = Query(None),
+    severity_type: Optional[str] = Query(None),
+    user=Depends(verify_supabase_jwt),
+):
+    """
+    Top incidents ranked by severity (critical > high > medium > low)
+    then by recency. Use ?severity=critical|high to narrow.
+    ?type= / ?severity_type= to filter by incident type.
+    """
+    ctx = _require_admin(user)
+    effective_type = type or severity_type
+
+    SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
+
+    q = (
+        _sb().table("incidents")
+        .select("id, type, secret_type, severity, masked_preview, action, "
+                "timestamp, user_email, tab_url, tab_title, browser_info, extensions, org_id")
+        .eq("org_id", ctx["org_id"])
+        .order("timestamp", desc=True)
+        .limit(500)
+    )
+    if severity:
+        q = q.eq("severity", severity)
+    if effective_type:
+        q = q.eq("type", effective_type)
+
+    rows = q.execute().data or []
+
+    # Sort: severity rank first, then timestamp desc (already sorted)
+    rows.sort(key=lambda x: (SEV_ORDER.get(x.get("severity", "unknown"), 5), x.get("timestamp", "") and -1))
+    top = rows[:limit]
+
+    for r in top:
+        r["category"] = _category(r)
+
+    return {
+        "error": 0,
+        "count": len(top),
+        "threats": top,
+    }
+
+
+# ===========================================================================
+# USER & DEVICE GOVERNANCE
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/users/{user_id}/incidents
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/users/{target_user_id}/incidents")
+def admin_user_incidents(
+    target_user_id: str,
+    type: Optional[str] = Query(None),
+    severity_type: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(100, ge=1, le=500),
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    user=Depends(verify_supabase_jwt),
+):
+    """
+    All incidents for a specific org member.
+    ?type= / ?severity_type= / ?severity / date range / pagination all supported.
+    """
+    ctx = _require_admin(user)
+    effective_type = type or severity_type
+
+    # Verify user belongs to this org
+    member_check = (
+        _sb().table("organization_members")
+        .select("user_id")
+        .eq("org_id", ctx["org_id"])
+        .eq("user_id", target_user_id)
+        .execute()
+    )
+    if not member_check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "User not found in this organization"})
+
+    q = (
+        _sb().table("incidents")
+        .select("*", count="exact")
+        .eq("org_id", ctx["org_id"])
+        .eq("user_id", target_user_id)
+        .order("timestamp", desc=True)
+    )
+    if effective_type:
+        q = q.eq("type", effective_type)
+    if severity:
+        q = q.eq("severity", severity)
+    if start_time:
+        q = q.gte("timestamp", _to_iso(start_time, end_of_day=False))
+    if end_time:
+        q = q.lte("timestamp", _to_iso(end_time, end_of_day=True))
+    q = q.range(page * page_size, (page + 1) * page_size - 1)
+
+    res = q.execute()
+    incidents = res.data or []
+    total = res.count or len(incidents)
+
+    by_type:    Dict[str, int] = defaultdict(int)
+    by_severity: Dict[str, int] = defaultdict(int)
+    by_category: Dict[str, int] = defaultdict(int)
+    for i in incidents:
+        by_type[(i.get("type") or "unknown")] += 1
+        by_severity[(i.get("severity") or "unknown")] += 1
+        by_category[_category(i)] += 1
+        i["category"] = _category(i)
+
+    return {
+        "error": 0,
+        "user_id": target_user_id,
+        "count": len(incidents),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, -(-total // page_size)),
+        "by_type":     dict(by_type),
+        "by_severity": dict(by_severity),
+        "by_category": dict(by_category),
+        "incidents": incidents,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/users/{user_id}/settings
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/users/{target_user_id}/settings")
+def admin_user_get_settings(
+    target_user_id: str,
+    user=Depends(verify_supabase_jwt),
+):
+    """Read user_settings for a specific org member."""
+    ctx = _require_admin(user)
+
+    member_check = (
+        _sb().table("organization_members")
+        .select("user_id")
+        .eq("org_id", ctx["org_id"])
+        .eq("user_id", target_user_id)
+        .execute()
+    )
+    if not member_check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "User not found in this organization"})
+
+    res = _sb().table("user_settings").select("*").eq("user_id", target_user_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "Settings not found for this user"})
+
+    return {"error": 0, "user_id": target_user_id, "settings": res.data[0]}
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/admin/users/{user_id}/settings
+# ---------------------------------------------------------------------------
+
+@router.put("/admin/users/{target_user_id}/settings")
+def admin_user_update_settings(
+    target_user_id: str,
+    body: AdminSettingsUpdate,
+    user=Depends(verify_supabase_jwt),
+):
+    """
+    Admin override — update user_settings for a specific org member.
+    Only non-null fields in the request body are applied.
+    """
+    ctx = _require_admin(user)
+
+    member_check = (
+        _sb().table("organization_members")
+        .select("user_id")
+        .eq("org_id", ctx["org_id"])
+        .eq("user_id", target_user_id)
+        .execute()
+    )
+    if not member_check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "User not found in this organization"})
+
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "No fields provided to update"})
+
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _sb().table("user_settings").upsert({"user_id": target_user_id, **updates}, on_conflict="user_id").execute()
+
+    res = _sb().table("user_settings").select("*").eq("user_id", target_user_id).execute()
+    return {"error": 0, "user_id": target_user_id, "settings": res.data[0] if res.data else {}}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/devices  —  all unique devices seen across the org
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/devices")
+def admin_devices(user=Depends(verify_supabase_jwt)):
+    """
+    All unique browser_id values seen in org incidents, enriched with
+    last-seen timestamp, extension version, browser_info, and incident count.
+    """
+    ctx = _require_admin(user)
+    incidents = _fetch_org_incidents(ctx["org_id"])
+
+    device_map: Dict[str, dict] = {}
+    for i in incidents:
+        bid = i.get("browser_id")
+        if not bid:
+            continue
+        if bid not in device_map:
+            device_map[bid] = {
+                "browser_id":        bid,
+                "user_email":        i.get("user_email", ""),
+                "user_id":           i.get("user_id", ""),
+                "extension_version": i.get("extension_version", ""),
+                "browser_info":      i.get("browser_info") or {},
+                "last_seen":         i.get("timestamp") or "",
+                "incident_count":    0,
+                "by_type":           defaultdict(int),
+            }
+        device_map[bid]["incident_count"] += 1
+        itype = (i.get("type") or "unknown")
+        device_map[bid]["by_type"][itype] += 1
+        ts = i.get("timestamp") or ""
+        if ts > device_map[bid]["last_seen"]:
+            device_map[bid]["last_seen"] = ts
+            device_map[bid]["extension_version"] = i.get("extension_version", "") or device_map[bid]["extension_version"]
+
+    devices = []
+    for d in device_map.values():
+        d["by_type"] = dict(d["by_type"])
+        devices.append(d)
+
+    devices.sort(key=lambda x: x["last_seen"], reverse=True)
+
+    return {
+        "error": 0,
+        "total_devices": len(devices),
+        "devices": devices,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/devices/{browser_id}  —  incident history for one device
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/devices/{browser_id}")
+def admin_device_detail(
+    browser_id: str,
+    page: int = Query(0, ge=0),
+    page_size: int = Query(100, ge=1, le=500),
+    user=Depends(verify_supabase_jwt),
+):
+    """Paginated incident history for a specific device (browser_id)."""
+    ctx = _require_admin(user)
+
+    q = (
+        _sb().table("incidents")
+        .select("*", count="exact")
+        .eq("org_id", ctx["org_id"])
+        .eq("browser_id", browser_id)
+        .order("timestamp", desc=True)
+    )
+    q = q.range(page * page_size, (page + 1) * page_size - 1)
+    res = q.execute()
+    incidents = res.data or []
+    total = res.count or len(incidents)
+
+    if not incidents and page == 0:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "Device not found or no incidents"})
+
+    by_type:     Dict[str, int] = defaultdict(int)
+    by_severity: Dict[str, int] = defaultdict(int)
+    for i in incidents:
+        by_type[(i.get("type") or "unknown")] += 1
+        by_severity[(i.get("severity") or "unknown")] += 1
+        i["category"] = _category(i)
+
+    # Device summary from first incident
+    first = incidents[0] if incidents else {}
+    return {
+        "error": 0,
+        "browser_id": browser_id,
+        "device_info": {
+            "user_email":        first.get("user_email", ""),
+            "user_id":           first.get("user_id", ""),
+            "extension_version": first.get("extension_version", ""),
+            "browser_info":      first.get("browser_info") or {},
+        },
+        "count": len(incidents),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, -(-total // page_size)),
+        "by_type":     dict(by_type),
+        "by_severity": dict(by_severity),
+        "incidents": incidents,
+    }
+
+
+# ===========================================================================
+# DASHBOARD SUMMARY  —  single super-call for the main dashboard page
+# ===========================================================================
+
+@router.get("/admin/dashboard/summary")
+def admin_dashboard_summary(user=Depends(verify_supabase_jwt)):
+    """
+    Returns everything the main IT-Admin dashboard needs in one request:
+    - Risk score + grade + top factors
+    - Category counts (secrets / phishing / email_dlp / extension / other)
+    - Severity breakdown
+    - Top 5 recent critical/high incidents
+    - Team member count + active device count
+    - This-week vs last-week incident delta
+    - Per-category 7-day trend (daily counts)
+    """
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    all_incidents = _fetch_org_incidents(org_id)
+    now = datetime.now(timezone.utc)
+    week_ago  = now - timedelta(days=7)
+    two_weeks = now - timedelta(days=14)
+    DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    # ── Team & device counts ─────────────────────────────────────────────
+    members_res = _sb().table("organization_members").select("user_id").eq("org_id", org_id).execute()
+    total_members = len(members_res.data or [])
+    devices = {i["browser_id"] for i in all_incidents if i.get("browser_id")}
+
+    # ── Week slices ───────────────────────────────────────────────────────
+    this_week = [i for i in all_incidents if _parse_ts(i) and _parse_ts(i) >= week_ago]
+    last_week = [i for i in all_incidents if _parse_ts(i) and two_weeks <= _parse_ts(i) < week_ago]
+
+    # ── Category & severity breakdowns ───────────────────────────────────
+    cat_counts: Dict[str, int]  = defaultdict(int)
+    sev_counts: Dict[str, int]  = defaultdict(int)
+    action_counts: Dict[str, int] = defaultdict(int)
+    for i in all_incidents:
+        cat_counts[_category(i)] += 1
+        sev_counts[(i.get("severity") or "unknown")] += 1
+        action_counts[(i.get("action") or "unknown")] += 1
+
+    # ── Risk score ────────────────────────────────────────────────────────
+    risk = _compute_risk_score(all_incidents, total_members)
+
+    # ── Top 5 critical/high incidents ─────────────────────────────────────
+    SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
+    serious = [i for i in all_incidents if i.get("severity") in ("critical", "high")]
+    serious.sort(key=lambda x: (SEV_ORDER.get(x.get("severity", "unknown"), 5),
+                                 -(int(_parse_ts(x).timestamp()) if _parse_ts(x) else 0)))
+    top5 = [
+        {
+            "id":           i.get("id"),
+            "type":         i.get("type"),
+            "category":     _category(i),
+            "secret_type":  i.get("secret_type"),
+            "severity":     i.get("severity"),
+            "action":       i.get("action"),
+            "timestamp":    i.get("timestamp"),
+            "user_email":   i.get("user_email"),
+            "tab_url":      i.get("tab_url"),
+            "tab_title":    i.get("tab_title"),
+            "masked_preview": i.get("masked_preview"),
+        }
+        for i in serious[:5]
+    ]
+
+    # ── 7-day per-category daily trend ───────────────────────────────────
+    daily_trend: Dict[str, Dict[str, int]] = {}
+    for d in range(6, -1, -1):
+        day = (now - timedelta(days=d))
+        key = day.strftime("%Y-%m-%d")
+        daily_trend[key] = {
+            "date":      key,
+            "day":       DAY_NAMES[day.weekday()],
+            "secrets":   0,
+            "phishing":  0,
+            "email_dlp": 0,
+            "extension": 0,
+            "other":     0,
+            "total":     0,
+        }
+    for i in all_incidents:
+        dt = _parse_ts(i)
+        if not dt or (now - dt).days >= 7:
+            continue
+        key = dt.strftime("%Y-%m-%d")
+        if key not in daily_trend:
+            continue
+        cat = _category(i)
+        daily_trend[key][cat] = daily_trend[key].get(cat, 0) + 1
+        daily_trend[key]["total"] += 1
+
+    # ── Week-over-week delta ──────────────────────────────────────────────
+    wow_delta = len(this_week) - len(last_week)
+    wow_pct   = round(wow_delta / max(len(last_week), 1) * 100, 1)
+
+    return {
+        "error": 0,
+        "org_id": org_id,
+        "summary": {
+            "total_incidents":     len(all_incidents),
+            "this_week_incidents": len(this_week),
+            "wow_delta":           wow_delta,
+            "wow_delta_pct":       wow_pct,
+            "total_members":       total_members,
+            "active_devices":      len(devices),
+            "threats_blocked":     action_counts.get("blocked", 0),
+            "threats_masked":      action_counts.get("masked", 0),
+        },
+        "risk": {
+            "score":   risk["score"],
+            "grade":   risk["grade"],
+            "trend_7d": risk["score"] - _compute_risk_score(last_week, total_members)["score"],
+            "top_factors": risk["factors"][:3],
+        },
+        "category_breakdown": dict(cat_counts),
+        "severity_breakdown":  dict(sev_counts),
+        "action_breakdown":    dict(action_counts),
+        "top_critical_incidents": top5,
+        "daily_trend_7d": list(daily_trend.values()),
+    }
