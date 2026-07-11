@@ -2897,3 +2897,94 @@ def admin_dashboard_summary(user=Depends(verify_supabase_jwt)):
         "top_critical_incidents": top5,
         "daily_trend_7d": list(daily_trend.values()),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORG GROUPS  —  GET /api/admin/groups   PUT /api/admin/groups
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GroupUpsertBody(BaseModel):
+    groups: List[Dict[str, Any]]   # [{id, name}]
+
+_DEFAULT_GROUPS = [
+    {"id": "engineering", "name": "Engineering"},
+    {"id": "hr",          "name": "HR"},
+    {"id": "support",     "name": "Support"},
+    {"id": "call_center", "name": "Call Center"},
+    {"id": "finance",     "name": "Finance"},
+    {"id": "marketing",   "name": "Marketing"},
+    {"id": "all",         "name": "All Employees"},
+]
+
+
+@router.get("/admin/groups")
+def admin_get_groups(user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    try:
+        res = _sb().table("org_groups").select("*").eq("org_id", org_id).execute()
+        groups = res.data if res.data else _DEFAULT_GROUPS
+    except Exception:
+        groups = _DEFAULT_GROUPS
+
+    return {"error": 0, "groups": groups}
+
+
+@router.put("/admin/groups")
+def admin_upsert_groups(body: GroupUpsertBody, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    rows = [{"org_id": org_id, "group_id": g["id"], "name": g["name"]} for g in body.groups]
+    try:
+        _sb().table("org_groups").delete().eq("org_id", org_id).execute()
+        _sb().table("org_groups").insert(rows).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"error": 0, "groups": body.groups}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORG CONTROLS  —  GET /api/admin/controls   PUT /api/admin/controls
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ControlUpdateBody(BaseModel):
+    control_id: str
+    config: Dict[str, Any]
+
+
+@router.get("/admin/controls")
+def admin_get_controls(user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    try:
+        res = _sb().table("org_controls").select("*").eq("org_id", org_id).execute()
+        controls: Dict[str, Any] = {}
+        for row in (res.data or []):
+            controls[row["control_id"]] = row.get("config", {})
+    except Exception:
+        controls = {}
+
+    return {"error": 0, "controls": controls}
+
+
+@router.put("/admin/controls")
+def admin_upsert_control(body: ControlUpdateBody, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    row = {
+        "org_id":     org_id,
+        "control_id": body.control_id,
+        "config":     body.config,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _sb().table("org_controls").upsert(row, on_conflict="org_id,control_id").execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"error": 0, "control_id": body.control_id, "config": body.config}
