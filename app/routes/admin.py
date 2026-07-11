@@ -2920,50 +2920,216 @@ def admin_dashboard_summary(user=Depends(verify_supabase_jwt)):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ORG GROUPS  —  GET /api/admin/groups   PUT /api/admin/groups
+# ORG GROUPS  ─  full CRUD + member management
+#
+#   GET    /api/admin/groups                         list groups + members
+#   POST   /api/admin/groups                         create group
+#   PUT    /api/admin/groups/{group_id}              rename group
+#   DELETE /api/admin/groups/{group_id}              delete group
+#   POST   /api/admin/groups/{group_id}/members      add member(s)
+#   DELETE /api/admin/groups/{group_id}/members/{uid} remove member
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GroupUpsertBody(BaseModel):
-    groups: List[Dict[str, Any]]   # [{id, name}]
+class GroupCreateBody(BaseModel):
+    group_name: str
 
-_DEFAULT_GROUPS = [
-    {"id": "engineering", "name": "Engineering"},
-    {"id": "hr",          "name": "HR"},
-    {"id": "support",     "name": "Support"},
-    {"id": "call_center", "name": "Call Center"},
-    {"id": "finance",     "name": "Finance"},
-    {"id": "marketing",   "name": "Marketing"},
-    {"id": "all",         "name": "All Employees"},
-]
+class GroupRenameBody(BaseModel):
+    group_name: str
 
+class GroupMembersAddBody(BaseModel):
+    user_ids: List[str]          # one or more org member user_ids
+
+
+def _build_groups_response(org_id: str) -> List[Dict[str, Any]]:
+    """
+    Fetches org_groups and org_group_members, enriches members with email
+    using the incidents table (same pattern as /admin/team).
+    Returns a list of group dicts ready to send to the client.
+    """
+    sb = _sb()
+
+    # 1. All groups for this org
+    groups_res = sb.table("org_groups").select("*").eq("org_id", org_id).order("created_at").execute()
+    groups = groups_res.data or []
+
+    # 2. All group members for this org (one query)
+    members_res = sb.table("org_group_members").select("*").eq("org_id", org_id).execute()
+    members_rows = members_res.data or []
+
+    # 3. All org members to get roles
+    org_members_res = sb.table("organization_members").select("user_id, role").eq("org_id", org_id).execute()
+    role_map: Dict[str, str] = {m["user_id"]: m.get("role", "member") for m in (org_members_res.data or [])}
+
+    # 4. Build email map from incidents (cheapest available source)
+    email_map: Dict[str, str] = {}
+    try:
+        inc_res = (
+            sb.table("incidents")
+            .select("user_id, user_email")
+            .eq("org_id", org_id)
+            .limit(2000)
+            .execute()
+        )
+        for row in (inc_res.data or []):
+            uid = row.get("user_id")
+            if uid and uid not in email_map and row.get("user_email"):
+                email_map[uid] = row["user_email"]
+    except Exception:
+        pass
+
+    # 5. Index members by group_id
+    from collections import defaultdict as _dd
+    members_by_group: Dict[str, List[Dict]] = _dd(list)
+    for m in members_rows:
+        gid = m["group_id"]
+        uid = m["user_id"]
+        members_by_group[gid].append({
+            "user_id":  uid,
+            "email":    email_map.get(uid, ""),
+            "role":     role_map.get(uid, "member"),
+            "added_at": m.get("added_at"),
+        })
+
+    # 6. Assemble final list
+    result = []
+    for g in groups:
+        gid = g["id"]
+        m_list = members_by_group.get(gid, [])
+        result.append({
+            "id":           gid,
+            "group_name":   g.get("group_name", ""),
+            "org_id":       g.get("org_id"),
+            "member_count": len(m_list),
+            "members":      m_list,
+            "created_at":   g.get("created_at"),
+        })
+    return result
+
+
+# ── GET /api/admin/groups ────────────────────────────────────────────────────
 
 @router.get("/admin/groups")
 def admin_get_groups(user=Depends(verify_supabase_jwt)):
     ctx = _require_admin(user)
-    org_id = ctx["org_id"]
-
-    try:
-        res = _sb().table("org_groups").select("*").eq("org_id", org_id).execute()
-        groups = res.data if res.data else _DEFAULT_GROUPS
-    except Exception:
-        groups = _DEFAULT_GROUPS
-
-    return {"error": 0, "groups": groups}
+    groups = _build_groups_response(ctx["org_id"])
+    return {"error": 0, "groups": groups, "total": len(groups)}
 
 
-@router.put("/admin/groups")
-def admin_upsert_groups(body: GroupUpsertBody, user=Depends(verify_supabase_jwt)):
+# ── POST /api/admin/groups ───────────────────────────────────────────────────
+
+@router.post("/admin/groups")
+def admin_create_group(body: GroupCreateBody, user=Depends(verify_supabase_jwt)):
     ctx = _require_admin(user)
     org_id = ctx["org_id"]
 
-    rows = [{"org_id": org_id, "group_id": g["id"], "name": g["name"]} for g in body.groups]
+    name = body.group_name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "group_name is required"})
+
+    row = {
+        "org_id":     org_id,
+        "group_name": name,
+        "created_by": ctx["user_id"],
+    }
     try:
-        _sb().table("org_groups").delete().eq("org_id", org_id).execute()
-        _sb().table("org_groups").insert(rows).execute()
+        res = _sb().table("org_groups").insert(row).execute()
+        group = res.data[0] if res.data else row
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {"error": 0, "groups": body.groups}
+    return {"error": 0, "group": {**group, "member_count": 0, "members": []}}
+
+
+# ── PUT /api/admin/groups/{group_id} ─────────────────────────────────────────
+
+@router.put("/admin/groups/{group_id}")
+def admin_rename_group(group_id: str, body: GroupRenameBody, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    name = body.group_name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail={"error": 1, "message": "group_name is required"})
+
+    # Verify group belongs to this org
+    check = _sb().table("org_groups").select("id").eq("id", group_id).eq("org_id", org_id).execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "Group not found"})
+
+    _sb().table("org_groups").update({"group_name": name}).eq("id", group_id).execute()
+    return {"error": 0, "group_id": group_id, "group_name": name}
+
+
+# ── DELETE /api/admin/groups/{group_id} ──────────────────────────────────────
+
+@router.delete("/admin/groups/{group_id}")
+def admin_delete_group(group_id: str, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    check = _sb().table("org_groups").select("id").eq("id", group_id).eq("org_id", org_id).execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "Group not found"})
+
+    # Members are deleted via ON DELETE CASCADE in the DB
+    _sb().table("org_groups").delete().eq("id", group_id).execute()
+    return {"error": 0, "deleted": group_id}
+
+
+# ── POST /api/admin/groups/{group_id}/members ────────────────────────────────
+
+@router.post("/admin/groups/{group_id}/members")
+def admin_add_group_members(group_id: str, body: GroupMembersAddBody, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    # Verify group belongs to this org
+    check = _sb().table("org_groups").select("id").eq("id", group_id).eq("org_id", org_id).execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "Group not found"})
+
+    # Verify all user_ids are members of the org
+    valid_members_res = (
+        _sb().table("organization_members")
+        .select("user_id")
+        .eq("org_id", org_id)
+        .in_("user_id", body.user_ids)
+        .execute()
+    )
+    valid_ids = {m["user_id"] for m in (valid_members_res.data or [])}
+    invalid = [uid for uid in body.user_ids if uid not in valid_ids]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": 1, "message": f"Users not in org: {invalid}"}
+        )
+
+    rows = [
+        {"group_id": group_id, "org_id": org_id, "user_id": uid, "added_by": ctx["user_id"]}
+        for uid in body.user_ids
+    ]
+    try:
+        # upsert — ignore duplicates
+        _sb().table("org_group_members").upsert(rows, on_conflict="group_id,user_id").execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"error": 0, "added": list(valid_ids), "group_id": group_id}
+
+
+# ── DELETE /api/admin/groups/{group_id}/members/{user_id} ───────────────────
+
+@router.delete("/admin/groups/{group_id}/members/{user_id}")
+def admin_remove_group_member(group_id: str, user_id: str, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    check = _sb().table("org_groups").select("id").eq("id", group_id).eq("org_id", org_id).execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "Group not found"})
+
+    _sb().table("org_group_members").delete().eq("group_id", group_id).eq("user_id", user_id).execute()
+    return {"error": 0, "removed": user_id, "group_id": group_id}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
