@@ -728,6 +728,26 @@ class AdminSettingsUpdate(BaseModel):
     site_exclusions: Optional[list] = None
     enterprise_email_domains: Optional[list] = None
     Plans: Optional[str] = None
+    # Phishing site detection
+    phish_detection: Optional[bool] = None
+    link_hover_detection: Optional[bool] = None
+    phish_detection_alert: Optional[bool] = None
+    phish_detection_block: Optional[bool] = None
+    domain_age_alert: Optional[bool] = None
+    # Phishing mail detection
+    phish_mail_detection: Optional[bool] = None
+    phish_mail_action: Optional[str] = None
+    # Email DLP
+    email_dlp_domain: Optional[list] = None
+    email_dlp_action: Optional[str] = None
+    IT_mail: Optional[str] = None
+    # Extension controls
+    blacklist_extension: Optional[dict] = None
+    blacklist_extension_status: Optional[str] = None
+    extension_scrape_data: Optional[bool] = None
+    password_breach_data: Optional[bool] = None
+    # Misc
+    blur_web: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------

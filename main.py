@@ -20,7 +20,8 @@
 # app.include_router(subscription_router, prefix="/api")
 # app.include_router(settings_router, prefix="/api")
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
 from app.routes.auth import router as auth_router
 from app.routes.me import router as me_router
@@ -41,31 +42,59 @@ app = FastAPI(
     openapi_url=None      # disables /openapi.json
 )
 
-origins = [
-    # local dev
+_ALLOWED_ORIGINS_EXACT = {
     "http://127.0.0.1:5500",
     "http://localhost:5500",
     "http://127.0.0.1:3000",
     "http://localhost:3000",
     "http://127.0.0.1:8000",
     "http://localhost:8000",
-    # production
     "https://securelint.app",
     "https://vaptlabs.com",
     "https://securelint.in",
     "https://www.securelint.in",
-    # Netlify deployments (main + preview branches)
     "https://securelint-nextjs.netlify.app",
     "https://securelint.netlify.app",
-]
+}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,          # explicit list required when allow_credentials=True
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+_ALLOWED_ORIGIN_SUFFIXES = (
+    ".netlify.app",
+    ".vercel.app",
 )
+
+def _is_allowed_origin(origin: str) -> bool:
+    if origin in _ALLOWED_ORIGINS_EXACT:
+        return True
+    for suffix in _ALLOWED_ORIGIN_SUFFIXES:
+        if origin.endswith(suffix):
+            return True
+    return False
+
+_CORS_HEADERS = {
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Methods":     "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers":     "Authorization, Content-Type, X-Requested-With",
+    "Access-Control-Max-Age":           "600",
+}
+
+@app.middleware("http")
+async def dynamic_cors(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    allowed = _is_allowed_origin(origin)
+
+    # Preflight
+    if request.method == "OPTIONS":
+        headers = dict(_CORS_HEADERS)
+        headers["Access-Control-Allow-Origin"] = origin if allowed else ""
+        return Response(status_code=204, headers=headers)
+
+    response = await call_next(request)
+    if allowed:
+        response.headers["Access-Control-Allow-Origin"]      = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"]     = _CORS_HEADERS["Access-Control-Allow-Methods"]
+        response.headers["Access-Control-Allow-Headers"]     = _CORS_HEADERS["Access-Control-Allow-Headers"]
+    return response
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(me_router, prefix="/api")
