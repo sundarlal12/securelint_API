@@ -653,12 +653,25 @@ def admin_team(user=Depends(verify_supabase_jwt)):
             if ts and (uid not in last_seen or ts > last_seen[uid]):
                 last_seen[uid] = ts
 
-    # Build member list with email from incidents (email not stored in org_members)
-    email_map = {}
+    # Build email map from incidents first (fast path)
+    email_map: dict = {}
     for i in incidents:
         uid = i.get("user_id")
         if uid and uid not in email_map:
             email_map[uid] = i.get("user_email")
+
+    # Find member IDs still missing an email (e.g. new members with 0 incidents)
+    # Fetch each missing email individually from auth.users via admin API
+    if _SERVICE_KEY:
+        sb_admin = _sb()
+        for m in members:
+            uid = m["user_id"]
+            if not email_map.get(uid):
+                try:
+                    auth_user = sb_admin.auth.admin.get_user_by_id(uid)
+                    email_map[uid] = getattr(auth_user.user, "email", None)
+                except Exception:
+                    pass  # non-fatal — email stays None
 
     team = []
     for m in members:
