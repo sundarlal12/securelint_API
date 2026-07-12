@@ -3210,6 +3210,109 @@ def admin_remove_group_member(group_id: str, user_id: str, user=Depends(verify_s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ENTERPRISE GROUP POLICY
+#   GET    /api/admin/groups/{group_id}/policy  — read group policy
+#   PUT    /api/admin/groups/{group_id}/policy  — create / update (deep-merge)
+#   DELETE /api/admin/groups/{group_id}/policy  — clear policy
+#   GET    /api/admin/groups/policies           — list all group policies for org
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _verify_group_owner(group_id: str, org_id: str) -> None:
+    """Raises 404 if the group does not belong to the org."""
+    check = _sb().table("org_groups").select("id").eq("id", group_id).eq("org_id", org_id).execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail={"error": 1, "message": "Group not found"})
+
+
+@router.get("/admin/groups/policies")
+def admin_list_group_policies(user=Depends(verify_supabase_jwt)):
+    """Return all enterprise_group_policy rows for this org, keyed by group_id."""
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+    res = _sb().table("enterprise_group_policy").select("*").eq("org_id", org_id).execute()
+    rows = res.data or []
+    # Parse settings JSON string if needed
+    for row in rows:
+        if isinstance(row.get("settings"), str):
+            try:
+                row["settings"] = __import__("json").loads(row["settings"])
+            except Exception:
+                row["settings"] = {}
+    return {"error": 0, "policies": rows, "total": len(rows)}
+
+
+@router.get("/admin/groups/{group_id}/policy")
+def admin_get_group_policy(group_id: str, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+    _verify_group_owner(group_id, org_id)
+
+    res = _sb().table("enterprise_group_policy").select("*").eq("group_id", group_id).eq("org_id", org_id).execute()
+    if not res.data:
+        return {"error": 0, "policy": {}, "group_id": group_id, "exists": False}
+
+    row = res.data[0]
+    settings = row.get("settings", {})
+    if isinstance(settings, str):
+        try:
+            settings = __import__("json").loads(settings)
+        except Exception:
+            settings = {}
+    return {"error": 0, "policy": settings, "group_id": group_id, "id": row["id"], "exists": True}
+
+
+@router.put("/admin/groups/{group_id}/policy")
+def admin_upsert_group_policy(group_id: str, body: Dict[str, Any], user=Depends(verify_supabase_jwt)):
+    """
+    Deep-merge the incoming fields into the group's existing policy.
+    Passing {} clears the policy for that group (use DELETE instead for removal).
+    """
+    import json as _j
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+    _verify_group_owner(group_id, org_id)
+
+    # Fetch existing settings
+    existing_res = _sb().table("enterprise_group_policy").select("settings").eq("group_id", group_id).eq("org_id", org_id).execute()
+    current: Dict[str, Any] = {}
+    if existing_res.data:
+        raw = existing_res.data[0].get("settings", {})
+        if isinstance(raw, str):
+            try:
+                raw = _j.loads(raw)
+            except Exception:
+                raw = {}
+        current = raw if isinstance(raw, dict) else {}
+
+    merged = {**current, **body}
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        _sb().table("enterprise_group_policy").upsert(
+            {
+                "org_id":     org_id,
+                "group_id":   group_id,
+                "settings":   _j.dumps(merged),
+                "updated_at": now,
+            },
+            on_conflict="org_id,group_id",
+        ).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
+
+    return {"error": 0, "policy": merged, "group_id": group_id}
+
+
+@router.delete("/admin/groups/{group_id}/policy")
+def admin_delete_group_policy(group_id: str, user=Depends(verify_supabase_jwt)):
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+    _verify_group_owner(group_id, org_id)
+    _sb().table("enterprise_group_policy").delete().eq("group_id", group_id).eq("org_id", org_id).execute()
+    return {"error": 0, "deleted": group_id}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ORG CONTROLS  —  GET /api/admin/controls   PUT /api/admin/controls
 # ─────────────────────────────────────────────────────────────────────────────
 

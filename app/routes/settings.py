@@ -12,34 +12,17 @@ supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 _SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 supabase_service = create_client(SUPABASE_URL, _SERVICE_KEY) if _SERVICE_KEY else supabase
 
-# Array-type columns — preserve as-is when masking
-_ARRAY_COLUMNS = {"waf_social_domain", "email_dlp_domain", "enterprise_email_domains",
-                  "site_exclusions", "phish_site_whitelist", "phish_mail_whitelist",
-                  "session_domains"}
-
-# Maps each Controls page control_id → user_settings fields it owns
-_CONTROL_FIELDS = {
-    "phishing_site":       ["phish_detection", "phish_detection_alert", "phish_detection_block",
-                            "link_hover_detection", "domain_age_alert", "phish_site_whitelist"],
-    "phishing_mail":       ["phish_mail_detection", "phish_mail_action", "phish_mail_whitelist"],
-    "waf_domain":          ["waf_social_domain"],
-    "session_theft":       ["session_marker", "session_domains"],
-    "malicious_extension": ["blacklist_extension", "blacklist_extension_status"],
-    "email_dlp":           ["email_dlp_enabled", "email_dlp_domain", "email_dlp_action"],
-    "secret_masking":      ["global_masking_status", "masking_style", "mask_console",
-                            "auto_mask_textareas", "auto_mask_inputs", "auto_mask_editor",
-                            "overlay_input", "overlay_textarea", "overlay_editor",
-                            "block_network_secrets", "block_form_submission",
-                            "site_exclusions", "site_exclusions_status"],
+# Columns that are never boolean — keep as-is during masking
+_ARRAY_COLUMNS = {
+    "waf_social_domain", "email_dlp_domain", "enterprise_email_domains",
+    "site_exclusions", "phish_site_whitelist", "phish_mail_whitelist",
+    "session_domains",
 }
 
 
+# ── Helper: mask all boolean features to False (inactive subscription) ────────
+
 def _mask_all_features(settings: dict, supabase_client) -> dict:
-    """
-    Returns a copy of settings with all boolean feature flags set to False.
-    Array columns are preserved as-is (None / []).
-    Non-boolean fields (masking_style, Plans, etc.) are also preserved.
-    """
     boolean_cols = _get_all_features(supabase_client)
     masked = dict(settings)
     for col in boolean_cols:
@@ -48,150 +31,140 @@ def _mask_all_features(settings: dict, supabase_client) -> dict:
     return masked
 
 
-def _apply_org_controls(user_id: str, user_settings: dict, supabase_client) -> dict:
+# ── Helper: resolve enterprise group policy for a non-admin org member ────────
+
+def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
     """
-    Enterprise-only: overlays the org admin's control configuration onto the
-    user's settings, gated by the user's group membership (control_groups).
+    For Enterprise org employees only:
+      1. Find the user's org.
+      2. Verify the org admin has an active Enterprise subscription.
+      3. Find the user's single group in this org.
+      4. Fetch that group's enterprise_group_policy.settings.
+      5. Return the policy settings dict (may be {}), or None if not applicable.
 
-    Logic per control:
-      - control_groups[ctrl] is empty / missing  → applies to ALL org members
-      - control_groups[ctrl] has group IDs       → applies only to members in those groups
-    If user is NOT in the required groups, all features for that control are
-    disabled / cleared in the response.
-
-    Returns a (possibly modified) copy of user_settings.
+    Returns:
+      None  — caller should use the user's own user_settings (e.g. admin, or non-enterprise)
+      {}    — enterprise employee but no group / no policy → all-False is safe default
+      dict  — the effective settings to return to the employee
     """
     try:
-        # 1. Resolve the user's org
+        sb = supabase_client
+
+        # ── 1. Org membership ────────────────────────────────────────────────
         org_res = (
-            supabase_client.table("organization_members")
-            .select("org_id")
+            sb.table("organization_members")
+            .select("org_id, role")
             .eq("user_id", user_id)
             .limit(1)
             .execute()
         )
         if not org_res.data:
-            return user_settings
-        org_id = org_res.data[0]["org_id"]
+            return None
+        org_id    = org_res.data[0]["org_id"]
+        user_role = org_res.data[0].get("role", "employee")
 
-        # 2. Find the org admin / owner
+        # Admins / owners are not subject to group policy — use their own row
+        if user_role in ("admin", "owner"):
+            return None
+
+        # ── 2. Org admin + subscription check ───────────────────────────────
         admin_res = (
-            supabase_client.table("organization_members")
-            .select("user_id, role")
+            sb.table("organization_members")
+            .select("user_id")
             .eq("org_id", org_id)
             .in_("role", ["admin", "owner"])
             .limit(1)
             .execute()
         )
         if not admin_res.data:
-            return user_settings
+            return None
         admin_uid = admin_res.data[0]["user_id"]
 
-        # 3. Get admin's user_settings
-        admin_st_res = (
-            supabase_client.table("user_settings")
-            .select("*")
+        sub_res = (
+            sb.table("user_subscriptions")
+            .select("status, plan_id")
             .eq("user_id", admin_uid)
+            .order("created_at", desc=True)
+            .limit(1)
             .execute()
         )
-        if not admin_st_res.data:
-            return user_settings
-        admin_st = admin_st_res.data[0]
+        if not sub_res.data:
+            return {}   # no sub on admin → no enterprise features
+        sub = sub_res.data[0]
+        if sub.get("status") != "active" or (sub.get("plan_id") or "").lower() != "enterprise":
+            return {}   # not active Enterprise → no features for employees
 
-        # 4. Only Enterprise orgs get group-based controls
-        plan = (admin_st.get("Plans") or "").lower()
-        if plan != "enterprise":
-            return user_settings
-
-        # 5. User's group memberships in this org
-        ug_res = (
-            supabase_client.table("org_group_members")
+        # ── 3. User's group in this org ─────────────────────────────────────
+        grp_res = (
+            sb.table("org_group_members")
             .select("group_id")
             .eq("org_id", org_id)
             .eq("user_id", user_id)
+            .limit(1)
             .execute()
         )
-        user_group_ids: set = {row["group_id"] for row in (ug_res.data or [])}
+        if not grp_res.data:
+            return {}   # not assigned to any group → no policy → all-False
+        group_id = grp_res.data[0]["group_id"]
 
-        # 6. control_groups from admin settings (may be stored as JSON string)
-        raw_cg = admin_st.get("control_groups") or {}
-        if isinstance(raw_cg, str):
+        # ── 4. Fetch enterprise_group_policy for that group ──────────────────
+        pol_res = (
+            sb.table("enterprise_group_policy")
+            .select("settings")
+            .eq("group_id", group_id)
+            .eq("org_id", org_id)
+            .execute()
+        )
+        if not pol_res.data:
+            return {}   # group exists but has no policy configured → all-False
+
+        raw = pol_res.data[0].get("settings", {})
+        if isinstance(raw, str):
             try:
-                raw_cg = _json.loads(raw_cg)
+                raw = _json.loads(raw)
             except Exception:
-                raw_cg = {}
-        control_groups: dict = raw_cg if isinstance(raw_cg, dict) else {}
-
-        result = dict(user_settings)
-
-        # 7. Overlay admin control config, gated by group membership
-        for ctrl_id, fields in _CONTROL_FIELDS.items():
-            allowed_group_ids = control_groups.get(ctrl_id) or []
-
-            # No group restriction → all org members get this control
-            if not allowed_group_ids:
-                user_has_access = True
-            else:
-                user_has_access = bool(user_group_ids.intersection(set(allowed_group_ids)))
-
-            for field in fields:
-                if field not in admin_st:
-                    continue
-                admin_val = admin_st[field]
-                if user_has_access:
-                    result[field] = admin_val
-                else:
-                    # Disable / clear the feature for users outside the group
-                    if isinstance(admin_val, bool):
-                        result[field] = False
-                    elif isinstance(admin_val, list):
-                        result[field] = []
-                    elif isinstance(admin_val, dict):
-                        result[field] = {}
-                    else:
-                        result[field] = None
-
-        return result
+                raw = {}
+        return raw if isinstance(raw, dict) else {}
 
     except Exception as exc:
-        print(f"[org_controls] error for user {user_id}: {exc}")
-        return user_settings
+        print(f"[enterprise_settings] error for user {user_id}: {exc}")
+        return None   # fall back to own settings on unexpected error
 
+
+# ── GET /settings ─────────────────────────────────────────────────────────────
 
 @router.get("/settings")
 def get_settings(user=Depends(verify_supabase_jwt)):
     user_id = user["sub"]
 
-    # ── Fetch user_settings row ───────────────────────────────────────────────
+    # Fetch own user_settings row
     res = supabase_service.table("user_settings").select("*").eq("user_id", user_id).execute()
 
     if not res.data:
         try:
-            sub_res = supabase_service.table("user_subscriptions").select("plan_id").eq("user_id", user_id).limit(1).execute()
+            sub_res = (
+                supabase_service.table("user_subscriptions")
+                .select("plan_id").eq("user_id", user_id).limit(1).execute()
+            )
             plan_id = sub_res.data[0]["plan_id"] if sub_res.data else "free"
         except Exception:
             plan_id = "free"
-
         default_row = build_settings_row(user_id, plan_id, supabase_service)
         try:
             supabase_service.table("user_settings").insert(default_row).execute()
         except Exception:
             pass
-        settings = default_row
+        own_settings = default_row
     else:
-        settings = res.data[0]
+        own_settings = res.data[0]
 
-    # ── Check subscription status ─────────────────────────────────────────────
+    # Check own subscription
     is_active = False
-    plan_id = settings.get("Plans", "free")
+    plan_id   = own_settings.get("Plans", "free")
     try:
         sub_res = (
-            supabase_service
-            .table("user_subscriptions")
-            .select("plan_id, status")
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
+            supabase_service.table("user_subscriptions")
+            .select("plan_id, status").eq("user_id", user_id).limit(1).execute()
         )
         if sub_res.data:
             is_active = sub_res.data[0].get("status") == "active"
@@ -199,49 +172,57 @@ def get_settings(user=Depends(verify_supabase_jwt)):
     except Exception:
         pass
 
-    # ── Gate: return real settings only if subscription is active ─────────────
-    if not is_active:
-        result = _mask_all_features(settings, supabase_service)
+    if is_active:
+        # User has their own active subscription — use own settings as-is
+        result = dict(own_settings)
     else:
-        result = dict(settings)
-        # Enterprise: overlay group-based org control settings
-        if plan_id and plan_id.lower() == "enterprise":
-            result = _apply_org_controls(user_id, result, supabase_service)
+        # No own subscription — check if they're an enterprise org employee
+        enterprise_settings = _resolve_enterprise_settings(user_id, supabase_service)
+
+        if enterprise_settings is None:
+            # Non-enterprise path — mask everything
+            result = _mask_all_features(own_settings, supabase_service)
+        elif enterprise_settings:
+            # Enterprise employee with a configured group policy
+            result = enterprise_settings
+            is_active = True  # treated as active for the extension
+        else:
+            # Enterprise employee but no group / no policy → all-False
+            result = _mask_all_features(own_settings, supabase_service)
 
     result["subscription_active"] = is_active
     result["plan_id"]             = plan_id
     return result
 
 
+# ── PUT /settings (user-side update — limited fields) ─────────────────────────
+
 @router.put("/settings")
 def update_settings(updates: dict, user=Depends(verify_supabase_jwt)):
     user_id = user["sub"]
 
-    # Only allow columns that exist in user_settings
     boolean_cols = set(_get_all_features(supabase_service))
-    non_boolean_allowed = {"masking_style", "site_exclusions", "waf_social_domain",
-                           "enterprise_email_domains", "email_dlp_domain",
-                           "email_dlp_action", "IT_mail", "Plans",
-                           "session_marker", "session_domains",
-                           "phish_site_whitelist", "phish_mail_whitelist",
-                           "control_groups"}
+    non_boolean_allowed = {
+        "masking_style", "site_exclusions", "waf_social_domain",
+        "enterprise_email_domains", "email_dlp_domain",
+        "email_dlp_action", "IT_mail", "Plans",
+        "session_marker", "session_domains",
+        "phish_site_whitelist", "phish_mail_whitelist",
+        "control_groups",
+    }
     allowed_fields = boolean_cols | non_boolean_allowed
-
-    clean_updates = {k: v for k, v in updates.items() if k in allowed_fields}
+    clean_updates  = {k: v for k, v in updates.items() if k in allowed_fields}
 
     if not clean_updates:
         return {"success": False, "message": "No valid settings fields provided"}
 
-    # Ensure row exists
     exists = supabase_service.table("user_settings").select("user_id").eq("user_id", user_id).execute()
     if not exists.data:
         supabase_service.table("user_settings").insert({"user_id": user_id}).execute()
 
-    # Serialize JSONB fields
     for col in {"control_groups"}:
         if col in clean_updates and isinstance(clean_updates[col], (dict, list)):
             clean_updates[col] = _json.dumps(clean_updates[col])
 
     supabase_service.table("user_settings").update(clean_updates).eq("user_id", user_id).execute()
-
     return {"success": True, "updated": clean_updates}
