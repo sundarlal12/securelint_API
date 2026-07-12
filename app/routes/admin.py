@@ -766,6 +766,9 @@ class AdminSettingsUpdate(BaseModel):
     # Phishing detection whitelists
     phish_site_whitelist: Optional[list] = None
     phish_mail_whitelist: Optional[list] = None
+    # Session theft detection
+    session_marker: Optional[str] = None
+    session_domains: Optional[list] = None
 
 
 # ---------------------------------------------------------------------------
@@ -895,29 +898,42 @@ def admin_get_settings(user=Depends(verify_supabase_jwt)):
 
 @router.put("/admin/settings")
 def admin_update_settings(body: AdminSettingsUpdate, user=Depends(verify_supabase_jwt)):
+    import json as _json
+
     ctx = _require_admin(user)
     user_id = ctx["user_id"]
 
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    # model_dump() uses None for unset optional fields; exclude them
+    raw = body.model_dump()
+    updates: Dict[str, Any] = {k: v for k, v in raw.items() if v is not None}
 
     if not updates:
         raise HTTPException(status_code=400, detail={"error": 1, "message": "No fields provided to update"})
 
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    _sb().table("user_settings").upsert(
-        {"user_id": user_id, **updates}
-    ).execute()
+    # JSONB columns must be serialised to a JSON string for supabase-py upsert
+    # to avoid silent type-coercion errors from PostgREST.
+    _JSONB_COLS = {"blacklist_extension", "control_groups"}
+    for col in _JSONB_COLS:
+        if col in updates and isinstance(updates[col], (dict, list)):
+            updates[col] = _json.dumps(updates[col])
 
-    res = (
-        _sb()
-        .table("user_settings")
-        .select("*")
-        .eq("user_id", user_id)
-        .execute()
-    )
+    sb = _sb()
 
-    return {"error": 0, "settings": res.data[0]}
+    # Use UPDATE (not UPSERT) – the row is always created at signup.
+    # Fall back to INSERT if the row is somehow missing.
+    existing = sb.table("user_settings").select("user_id").eq("user_id", user_id).execute()
+    try:
+        if existing.data:
+            sb.table("user_settings").update(updates).eq("user_id", user_id).execute()
+        else:
+            sb.table("user_settings").insert({"user_id": user_id, **updates}).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
+
+    res = sb.table("user_settings").select("*").eq("user_id", user_id).execute()
+    return {"error": 0, "settings": res.data[0] if res.data else {}}
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ from supabase import create_client
 from typing import Optional
 import os
 from app.core.config import SUPABASE_URL, SUPABASE_ANON_KEY
-from app.routes.settings import _mask_all_features
+from app.routes.settings import _mask_all_features, _apply_org_controls
 
 router = APIRouter()
 
@@ -76,6 +76,9 @@ def get_user_me(authorization: Optional[str] = Header(None)):
 
     if not is_active:
         settings = _mask_all_features(settings, supabase_service)
+    elif plan_id and plan_id.lower() == "enterprise":
+        # Enterprise users: overlay group-based org control settings
+        settings = _apply_org_controls(user_id, settings, supabase_service)
 
     return {
         "error":               0,
