@@ -105,12 +105,13 @@ def _build_flags(plan_id: str, active_features: set, supabase_client) -> Dict[st
 def build_settings_row(user_id: str, plan_id: str, supabase_client) -> Dict[str, Any]:
     """
     Returns a complete user_settings dict ready to INSERT at signup.
-    Stores the real plan features from plan_settings table.
-    The GET /api/settings endpoint gates access based on subscription status —
-    features are returned as False there if subscription is inactive.
+    ALL boolean features default to False — features are only unlocked
+    after a successful payment via apply_plan_settings().
+    The GET /api/admin/settings endpoint additionally enforces the
+    subscription status gate at read time.
     """
-    active = set(_fetch_plan_features(plan_id, supabase_client))
-    return {"user_id": user_id, **_build_flags(plan_id, active, supabase_client)}
+    # Pass an empty set so every boolean column is written as False.
+    return {"user_id": user_id, **_build_flags(plan_id, set(), supabase_client)}
 
 
 def apply_plan_settings(user_id: str, plan_id: str, supabase_client) -> None:

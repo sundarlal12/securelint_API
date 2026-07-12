@@ -761,6 +761,11 @@ class AdminSettingsUpdate(BaseModel):
     password_breach_data: Optional[bool] = None
     # Misc
     blur_web: Optional[bool] = None
+    # Per-control group assignments  {control_id: [group_id, …]}
+    control_groups: Optional[dict] = None
+    # Phishing detection whitelists
+    phish_site_whitelist: Optional[list] = None
+    phish_mail_whitelist: Optional[list] = None
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +854,39 @@ def admin_get_settings(user=Depends(verify_supabase_jwt)):
             .execute()
         )
 
-    return {"error": 0, "settings": res.data[0]}
+    settings_row: dict = dict(res.data[0]) if res.data else {}
+
+    # ── Subscription gate: mask all boolean features as False if subscription
+    # is inactive / missing (user hasn't paid yet). ───────────────────────────
+    sub_active = False
+    try:
+        sub_res = (
+            _sb()
+            .table("user_subscriptions")
+            .select("status, plan_id")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if sub_res.data:
+            sub_active = sub_res.data[0].get("status") == "active"
+    except Exception:
+        pass  # if query fails, default to inactive (safe side)
+
+    if not sub_active:
+        # Non-boolean / metadata columns to preserve as-is
+        _PRESERVE = {"user_id", "updated_at", "Plans", "created_at",
+                     "masking_style", "site_exclusions", "waf_social_domain",
+                     "enterprise_email_domains", "email_dlp_domain",
+                     "email_dlp_action", "IT_mail", "control_groups",
+                     "phish_site_whitelist", "phish_mail_whitelist",
+                     "blacklist_extension"}
+        for col, val in settings_row.items():
+            if col not in _PRESERVE and isinstance(val, bool) and val is True:
+                settings_row[col] = False
+
+    return {"error": 0, "settings": settings_row}
 
 
 # ---------------------------------------------------------------------------
