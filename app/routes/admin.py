@@ -3010,7 +3010,7 @@ def _build_groups_response(org_id: str) -> List[Dict[str, Any]]:
     org_members_res = sb.table("organization_members").select("user_id, role").eq("org_id", org_id).execute()
     role_map: Dict[str, str] = {m["user_id"]: m.get("role", "member") for m in (org_members_res.data or [])}
 
-    # 4. Build email map from incidents (cheapest available source)
+    # 4. Build email map — incidents table first (fast), then auth.users fallback
     email_map: Dict[str, str] = {}
     try:
         inc_res = (
@@ -3026,6 +3026,17 @@ def _build_groups_response(org_id: str) -> List[Dict[str, Any]]:
                 email_map[uid] = row["user_email"]
     except Exception:
         pass
+
+    # For member user_ids still missing an email, fall back to auth.users
+    if _SERVICE_KEY:
+        all_member_ids = {m["user_id"] for m in members_rows}
+        for uid in all_member_ids:
+            if not email_map.get(uid):
+                try:
+                    au = sb.auth.admin.get_user_by_id(uid)
+                    email_map[uid] = getattr(au.user, "email", None) or ""
+                except Exception:
+                    pass
 
     # 5. Index members by group_id
     from collections import defaultdict as _dd
