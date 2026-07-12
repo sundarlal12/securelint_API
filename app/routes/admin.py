@@ -912,12 +912,8 @@ def admin_update_settings(body: AdminSettingsUpdate, user=Depends(verify_supabas
 
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    # JSONB columns must be serialised to a JSON string for supabase-py upsert
-    # to avoid silent type-coercion errors from PostgREST.
-    _JSONB_COLS = {"blacklist_extension", "control_groups"}
-    for col in _JSONB_COLS:
-        if col in updates and isinstance(updates[col], (dict, list)):
-            updates[col] = _json.dumps(updates[col])
+    # supabase-py v2 serialises dicts/lists to JSON automatically for JSONB
+    # columns — do NOT call json.dumps() here (that would double-encode them).
 
     sb = _sb()
 
@@ -3231,14 +3227,83 @@ def admin_list_group_policies(user=Depends(verify_supabase_jwt)):
     org_id = ctx["org_id"]
     res = _sb().table("enterprise_group_policy").select("*").eq("org_id", org_id).execute()
     rows = res.data or []
-    # Parse settings JSON string if needed
     for row in rows:
-        if isinstance(row.get("settings"), str):
+        raw = row.get("settings", {})
+        while isinstance(raw, str):
             try:
-                row["settings"] = __import__("json").loads(row["settings"])
+                raw = __import__("json").loads(raw)
             except Exception:
-                row["settings"] = {}
+                raw = {}
+                break
+        row["settings"] = raw if isinstance(raw, dict) else {}
     return {"error": 0, "policies": rows, "total": len(rows)}
+
+
+class GroupPolicyBatchBody(BaseModel):
+    group_ids: List[str]
+    settings:  Dict[str, Any]
+
+
+@router.put("/admin/groups/policy/batch")
+def admin_upsert_group_policy_batch(body: GroupPolicyBatchBody, user=Depends(verify_supabase_jwt)):
+    """
+    Write (deep-merge) the same settings into multiple groups at once.
+    Pass group_ids=[] to write to ALL groups in the org.
+    """
+    import json as _j
+    ctx = _require_admin(user)
+    org_id = ctx["org_id"]
+
+    # Resolve target groups
+    if body.group_ids:
+        # validate all belong to org
+        for gid in body.group_ids:
+            _verify_group_owner(gid, org_id)
+        target_ids = body.group_ids
+    else:
+        # empty list → apply to ALL groups
+        all_groups = _sb().table("org_groups").select("id").eq("org_id", org_id).execute()
+        target_ids = [r["id"] for r in (all_groups.data or [])]
+
+    if not target_ids:
+        return {"error": 0, "updated": 0, "group_ids": []}
+
+    # Fetch existing policies for all targets
+    existing_res = (
+        _sb().table("enterprise_group_policy")
+        .select("group_id, settings")
+        .eq("org_id", org_id)
+        .in_("group_id", target_ids)
+        .execute()
+    )
+    existing_map: Dict[str, Any] = {}
+    for row in (existing_res.data or []):
+        raw = row.get("settings", {})
+        if isinstance(raw, str):
+            try:
+                raw = _j.loads(raw)
+            except Exception:
+                raw = {}
+        existing_map[row["group_id"]] = raw if isinstance(raw, dict) else {}
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for gid in target_ids:
+        current  = existing_map.get(gid, {})
+        merged   = {**current, **body.settings}
+        rows.append({
+            "org_id":     org_id,
+            "group_id":   gid,
+            "settings":   merged,
+            "updated_at": now,
+        })
+
+    try:
+        _sb().table("enterprise_group_policy").upsert(rows, on_conflict="org_id,group_id").execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": 1, "message": str(exc)})
+
+    return {"error": 0, "updated": len(rows), "group_ids": target_ids}
 
 
 @router.get("/admin/groups/{group_id}/policy")
@@ -3252,12 +3317,14 @@ def admin_get_group_policy(group_id: str, user=Depends(verify_supabase_jwt)):
         return {"error": 0, "policy": {}, "group_id": group_id, "exists": False}
 
     row = res.data[0]
-    settings = row.get("settings", {})
-    if isinstance(settings, str):
+    raw = row.get("settings", {})
+    while isinstance(raw, str):
         try:
-            settings = __import__("json").loads(settings)
+            raw = __import__("json").loads(raw)
         except Exception:
-            settings = {}
+            raw = {}
+            break
+    settings = raw if isinstance(raw, dict) else {}
     return {"error": 0, "policy": settings, "group_id": group_id, "id": row["id"], "exists": True}
 
 
@@ -3276,12 +3343,13 @@ def admin_upsert_group_policy(group_id: str, body: Dict[str, Any], user=Depends(
     existing_res = _sb().table("enterprise_group_policy").select("settings").eq("group_id", group_id).eq("org_id", org_id).execute()
     current: Dict[str, Any] = {}
     if existing_res.data:
-        raw = existing_res.data[0].get("settings", {})
-        if isinstance(raw, str):
+        raw: Any = existing_res.data[0].get("settings", {})
+        while isinstance(raw, str):
             try:
                 raw = _j.loads(raw)
             except Exception:
                 raw = {}
+                break
         current = raw if isinstance(raw, dict) else {}
 
     merged = {**current, **body}
@@ -3292,7 +3360,7 @@ def admin_upsert_group_policy(group_id: str, body: Dict[str, Any], user=Depends(
             {
                 "org_id":     org_id,
                 "group_id":   group_id,
-                "settings":   _j.dumps(merged),
+                "settings":   merged,   # pass dict directly — supabase-py handles JSONB
                 "updated_at": now,
             },
             on_conflict="org_id,group_id",

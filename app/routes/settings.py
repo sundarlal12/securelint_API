@@ -119,11 +119,13 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
             return {}   # group exists but has no policy configured → all-False
 
         raw = pol_res.data[0].get("settings", {})
-        if isinstance(raw, str):
+        # supabase-py returns JSONB as dict; guard against legacy string values
+        while isinstance(raw, str):
             try:
                 raw = _json.loads(raw)
             except Exception:
                 raw = {}
+                break
         return raw if isinstance(raw, dict) else {}
 
     except Exception as exc:
@@ -220,9 +222,7 @@ def update_settings(updates: dict, user=Depends(verify_supabase_jwt)):
     if not exists.data:
         supabase_service.table("user_settings").insert({"user_id": user_id}).execute()
 
-    for col in {"control_groups"}:
-        if col in clean_updates and isinstance(clean_updates[col], (dict, list)):
-            clean_updates[col] = _json.dumps(clean_updates[col])
+    # supabase-py v2 handles dicts as JSONB natively — no json.dumps needed.
 
     supabase_service.table("user_settings").update(clean_updates).eq("user_id", user_id).execute()
     return {"success": True, "updated": clean_updates}
