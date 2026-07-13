@@ -3,6 +3,7 @@ from supabase import create_client
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 import os
+import json as _json
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
@@ -859,6 +860,23 @@ def admin_get_settings(user=Depends(verify_supabase_jwt)):
 
     settings_row: dict = dict(res.data[0]) if res.data else {}
 
+    # ── Unwrap any JSONB columns that were previously double-encoded as strings ─
+    # Supabase stores them correctly as dicts now, but old rows may still hold
+    # a JSON string. Parse them recursively until we have a native dict/list.
+    _JSONB_COLS = {"blacklist_extension", "control_groups"}
+    for _col in _JSONB_COLS:
+        _raw = settings_row.get(_col)
+        while isinstance(_raw, str):
+            try:
+                _raw = _json.loads(_raw)
+            except Exception:
+                _raw = {} if _col == "blacklist_extension" else {}
+                break
+        if _col in settings_row:
+            settings_row[_col] = _raw if isinstance(_raw, (dict, list)) else (
+                {} if _col == "blacklist_extension" else {}
+            )
+
     # ── Subscription gate: mask all boolean features as False if subscription
     # is inactive / missing (user hasn't paid yet). ───────────────────────────
     sub_active = False
@@ -898,8 +916,6 @@ def admin_get_settings(user=Depends(verify_supabase_jwt)):
 
 @router.put("/admin/settings")
 def admin_update_settings(body: AdminSettingsUpdate, user=Depends(verify_supabase_jwt)):
-    import json as _json
-
     ctx = _require_admin(user)
     user_id = ctx["user_id"]
 
@@ -3250,7 +3266,6 @@ def admin_upsert_group_policy_batch(body: GroupPolicyBatchBody, user=Depends(ver
     Write (deep-merge) the same settings into multiple groups at once.
     Pass group_ids=[] to write to ALL groups in the org.
     """
-    import json as _j
     ctx = _require_admin(user)
     org_id = ctx["org_id"]
 
@@ -3278,12 +3293,13 @@ def admin_upsert_group_policy_batch(body: GroupPolicyBatchBody, user=Depends(ver
     )
     existing_map: Dict[str, Any] = {}
     for row in (existing_res.data or []):
-        raw = row.get("settings", {})
-        if isinstance(raw, str):
+        raw: Any = row.get("settings", {})
+        while isinstance(raw, str):
             try:
-                raw = _j.loads(raw)
+                raw = _json.loads(raw)
             except Exception:
                 raw = {}
+                break
         existing_map[row["group_id"]] = raw if isinstance(raw, dict) else {}
 
     now = datetime.now(timezone.utc).isoformat()
@@ -3334,7 +3350,6 @@ def admin_upsert_group_policy(group_id: str, body: Dict[str, Any], user=Depends(
     Deep-merge the incoming fields into the group's existing policy.
     Passing {} clears the policy for that group (use DELETE instead for removal).
     """
-    import json as _j
     ctx = _require_admin(user)
     org_id = ctx["org_id"]
     _verify_group_owner(group_id, org_id)
@@ -3346,7 +3361,7 @@ def admin_upsert_group_policy(group_id: str, body: Dict[str, Any], user=Depends(
         raw: Any = existing_res.data[0].get("settings", {})
         while isinstance(raw, str):
             try:
-                raw = _j.loads(raw)
+                raw = _json.loads(raw)
             except Exception:
                 raw = {}
                 break
