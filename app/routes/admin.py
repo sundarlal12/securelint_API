@@ -861,8 +861,6 @@ def admin_get_settings(user=Depends(verify_supabase_jwt)):
     settings_row: dict = dict(res.data[0]) if res.data else {}
 
     # ── Unwrap any JSONB columns that were previously double-encoded as strings ─
-    # Supabase stores them correctly as dicts now, but old rows may still hold
-    # a JSON string. Parse them recursively until we have a native dict/list.
     _JSONB_COLS = {"blacklist_extension", "control_groups"}
     for _col in _JSONB_COLS:
         _raw = settings_row.get(_col)
@@ -870,12 +868,21 @@ def admin_get_settings(user=Depends(verify_supabase_jwt)):
             try:
                 _raw = _json.loads(_raw)
             except Exception:
-                _raw = {} if _col == "blacklist_extension" else {}
+                _raw = {}
                 break
         if _col in settings_row:
-            settings_row[_col] = _raw if isinstance(_raw, (dict, list)) else (
-                {} if _col == "blacklist_extension" else {}
-            )
+            settings_row[_col] = _raw if isinstance(_raw, (dict, list)) else {}
+
+    # ── Normalise blacklist_extension: strip numeric keys left by old bug ────
+    _bl = settings_row.get("blacklist_extension")
+    if isinstance(_bl, dict):
+        _ids = _bl.get("ids") if isinstance(_bl.get("ids"), list) else [
+            v for k, v in _bl.items() if isinstance(k, str) and k.isdigit() and isinstance(v, str)
+        ]
+        settings_row["blacklist_extension"] = {
+            "ids":    _ids,
+            "action": _bl.get("action", "detect"),
+        }
 
     # ── Subscription gate: mask all boolean features as False if subscription
     # is inactive / missing (user hasn't paid yet). ───────────────────────────
