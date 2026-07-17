@@ -130,17 +130,18 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
                 break
         group_policy: dict = raw if isinstance(raw, dict) else {}
 
-        # ── 5. Normalise blacklist_extension in group policy ─────────────────
+        # ── 5. Normalise blacklist_extension to a plain array of IDs ─────────
+        # Canonical shape is a plain string[] of extension IDs; the action
+        # lives solely in blacklist_extension_status. Collapse any legacy
+        # {ids, action} object (or the older char-spread bug) into that array.
         _bl = group_policy.get("blacklist_extension")
         if isinstance(_bl, dict):
-            # Strip numeric keys left by old character-spread bug
             ids_list = _bl.get("ids") if isinstance(_bl.get("ids"), list) else [
                 v for k, v in _bl.items() if k.isdigit() and isinstance(v, str)
             ]
-            group_policy["blacklist_extension"] = {
-                "ids":    ids_list,
-                "action": _bl.get("action", "detect"),
-            }
+            group_policy["blacklist_extension"] = ids_list
+        elif not isinstance(_bl, list) and _bl is not None:
+            group_policy["blacklist_extension"] = []
 
         # ── 6. Return the policy settings AS-IS — no merge with user_settings ─
         return group_policy
