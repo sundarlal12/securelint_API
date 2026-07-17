@@ -240,6 +240,7 @@ def get_settings(user=Depends(verify_supabase_jwt)):
 
     result["subscription_active"] = is_active
     result["plan_id"]             = plan_id
+    result.pop("control_groups", None)  # internal-only, not exposed to the extension
     return result
 
 
