@@ -200,8 +200,15 @@ def get_settings(user=Depends(verify_supabase_jwt)):
 
     if enterprise_settings is not None:
         if enterprise_settings:
-            # Enterprise employee with a configured group policy
+            # Enterprise employee with a configured group policy.
+            # The policy only carries actual control fields — identity/
+            # metadata fields (user_id, updated_at, Plans) aren't policy
+            # content, so fill those from the employee's own row, same
+            # as any other user.
             result = enterprise_settings
+            result["user_id"]    = user_id
+            result["updated_at"] = own_settings.get("updated_at")
+            result["Plans"]      = own_settings.get("Plans", "Enterprise")
             is_active = True  # treated as active for the extension
         else:
             # Enterprise employee but org admin isn't active-Enterprise,
