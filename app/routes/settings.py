@@ -215,23 +215,28 @@ def get_settings(user=Depends(verify_supabase_jwt)):
     except Exception:
         pass
 
-    if is_active:
-        # User has their own active subscription — use own settings as-is
-        result = dict(own_settings)
-    else:
-        # No own subscription — check if they're an enterprise org employee
-        enterprise_settings = _resolve_enterprise_settings(user_id, supabase_service)
+    # Org employees are ALWAYS governed by their org's group policy —
+    # this takes priority over any personal subscription row they might
+    # also happen to have (e.g. they self-signed-up before being invited).
+    # _resolve_enterprise_settings() returns None for admins/owners and for
+    # users who aren't in any org, so those fall through to their own row.
+    enterprise_settings = _resolve_enterprise_settings(user_id, supabase_service)
 
-        if enterprise_settings is None:
-            # Non-enterprise path — mask everything
-            result = _mask_all_features(own_settings, supabase_service)
-        elif enterprise_settings:
+    if enterprise_settings is not None:
+        if enterprise_settings:
             # Enterprise employee with a configured group policy
             result = enterprise_settings
             is_active = True  # treated as active for the extension
         else:
-            # Enterprise employee but no group / no policy → all-False
+            # Enterprise employee but org admin isn't active-Enterprise,
+            # or no group / no policy configured → all-False
             result = _mask_all_features(own_settings, supabase_service)
+    elif is_active:
+        # Not an org employee (or is admin/owner) — own active subscription
+        result = dict(own_settings)
+    else:
+        # No own subscription and not an enterprise employee — mask everything
+        result = _mask_all_features(own_settings, supabase_service)
 
     result["subscription_active"] = is_active
     result["plan_id"]             = plan_id
