@@ -38,16 +38,16 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
     For Enterprise org employees only:
       1. Find the user's org.
       2. Verify the org admin has an active Enterprise subscription.
-      3. Load the org admin's full user_settings row (used as the base).
-      4. Find the user's single group in this org.
-      5. Fetch that group's enterprise_group_policy.settings.
-      6. Deep-merge group policy ON TOP of the admin's settings row.
-      7. Return the merged dict (may be {}), or None if not applicable.
+      3. Find the user's single group in this org.
+      4. Fetch that group's enterprise_group_policy.settings.
+      5. Return that policy dict AS-IS — enterprise employees are served
+         exclusively from enterprise_group_policy, never merged/blended
+         with any user_settings row (admin's or their own).
 
     Returns:
       None  — not an enterprise employee; caller uses own user_settings
       {}    — enterprise employee but no group / no policy → all-False safe default
-      dict  — merged admin settings + group policy overrides
+      dict  — the group's enterprise_group_policy.settings, unmodified
     """
     try:
         sb = supabase_client
@@ -96,28 +96,7 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
         if sub.get("status") != "active" or (sub.get("plan_id") or "").lower() != "enterprise":
             return {}   # not active Enterprise → employees get all-False
 
-        # ── 3. Load admin's full user_settings row as the base ───────────────
-        admin_settings_res = (
-            sb.table("user_settings")
-            .select("*")
-            .eq("user_id", admin_uid)
-            .execute()
-        )
-        admin_settings: dict = dict(admin_settings_res.data[0]) if admin_settings_res.data else {}
-
-        # Unwrap any legacy double-encoded JSONB strings in the admin row
-        for _col in ("blacklist_extension", "control_groups"):
-            _raw = admin_settings.get(_col)
-            while isinstance(_raw, str):
-                try:
-                    _raw = _json.loads(_raw)
-                except Exception:
-                    _raw = {}
-                    break
-            if _col in admin_settings:
-                admin_settings[_col] = _raw if isinstance(_raw, (dict, list)) else {}
-
-        # ── 4. User's group in this org ─────────────────────────────────────
+        # ── 3. User's group in this org ─────────────────────────────────────
         grp_res = (
             sb.table("org_group_members")
             .select("group_id")
@@ -127,11 +106,10 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
             .execute()
         )
         if not grp_res.data:
-            # Not in any group → return all-False (mask the admin row)
-            return _mask_all_features(admin_settings, sb)
+            return {}   # Not in any group → all-False, no policy to read from
         group_id = grp_res.data[0]["group_id"]
 
-        # ── 5. Fetch enterprise_group_policy for that group ──────────────────
+        # ── 4. Fetch enterprise_group_policy for that group ──────────────────
         pol_res = (
             sb.table("enterprise_group_policy")
             .select("settings")
@@ -140,8 +118,7 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
             .execute()
         )
         if not pol_res.data:
-            # Group exists but no policy → return all-False
-            return _mask_all_features(admin_settings, sb)
+            return {}   # Group exists but no policy configured yet → all-False
 
         raw = pol_res.data[0].get("settings", {})
         # Guard against legacy double-encoded string values
@@ -153,7 +130,7 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
                 break
         group_policy: dict = raw if isinstance(raw, dict) else {}
 
-        # ── 6. Normalise blacklist_extension in group policy ─────────────────
+        # ── 5. Normalise blacklist_extension in group policy ─────────────────
         _bl = group_policy.get("blacklist_extension")
         if isinstance(_bl, dict):
             # Strip numeric keys left by old character-spread bug
@@ -165,9 +142,8 @@ def _resolve_enterprise_settings(user_id: str, supabase_client) -> dict | None:
                 "action": _bl.get("action", "detect"),
             }
 
-        # ── 7. Merge: admin settings as base, group policy overrides ─────────
-        merged = {**admin_settings, **group_policy}
-        return merged
+        # ── 6. Return the policy settings AS-IS — no merge with user_settings ─
+        return group_policy
 
     except Exception as exc:
         print(f"[enterprise_settings] error for user {user_id}: {exc}")
